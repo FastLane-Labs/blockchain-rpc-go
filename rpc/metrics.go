@@ -18,22 +18,22 @@ type Metrics struct {
 func NewMetrics(reg prometheus.Registerer) *Metrics {
 	m := &Metrics{
 		ClientFunctionsCalls: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "client_functions_calls",
+			Name: "blockchain_rpc_go_client_functions_calls",
 			Help: "Number of times a client function is called",
 		}, []string{"id", "function"}),
 
 		RpcMethodsCalls: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "rpc_methods_calls",
+			Name: "blockchain_rpc_go_rpc_methods_calls",
 			Help: "Number of times an RPC method is called",
 		}, []string{"id", "method"}),
 
 		Errors: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "rpc_errors",
+			Name: "blockchain_rpc_go_rpc_errors",
 			Help: "Number of times an RPC method returns an error",
 		}, []string{"id", "method", "error"}),
 
 		RpcCallsDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Name:    "rpc_calls_duration",
+			Name:    "blockchain_rpc_go_rpc_calls_duration",
 			Help:    "Duration of RPC calls",
 			Buckets: histogramBuckets,
 		}, []string{"id", "method"}),
