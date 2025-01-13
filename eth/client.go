@@ -60,7 +60,7 @@ type IEthClient interface {
 }
 
 type EthClient struct {
-	c *brpc.RpcClient
+	c brpc.IRpcClient
 }
 
 func Dial(url string, cfg *brpc.RpcClientConfig) (*EthClient, error) {
@@ -76,8 +76,8 @@ func DialContext(ctx context.Context, url string, cfg *brpc.RpcClientConfig) (*E
 	return &EthClient{c: c}, nil
 }
 
-func NewClient(c *brpc.RpcClient) *EthClient {
-	return &EthClient{c}
+func NewClient(c brpc.IRpcClient) *EthClient {
+	return &EthClient{c: c}
 }
 
 func (ec *EthClient) Close() {
