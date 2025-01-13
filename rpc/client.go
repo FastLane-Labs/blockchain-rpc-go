@@ -55,6 +55,11 @@ func DialContext(ctx context.Context, url string, cfg *RpcClientConfig) (*RpcCli
 		return nil, err
 	}
 
+	id := uuid.New().String()
+	if cfg != nil && cfg.Id != "" {
+		id = cfg.Id
+	}
+
 	var sem *semaphore.Weighted
 	if cfg != nil && cfg.MaxConcurrency > 0 {
 		sem = semaphore.NewWeighted(int64(cfg.MaxConcurrency))
@@ -62,12 +67,7 @@ func DialContext(ctx context.Context, url string, cfg *RpcClientConfig) (*RpcCli
 
 	var metrics *Metrics
 	if cfg != nil && cfg.PrometheusRegisterer != nil {
-		metrics = NewMetrics(cfg.PrometheusRegisterer)
-	}
-
-	id := uuid.New().String()
-	if cfg != nil && cfg.Id != "" {
-		id = cfg.Id
+		metrics = getMetrics(cfg.PrometheusRegisterer)
 	}
 
 	return &RpcClient{
