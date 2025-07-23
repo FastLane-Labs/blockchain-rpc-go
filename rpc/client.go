@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/semaphore"
+	"golang.org/x/time/rate"
 )
 
 type IRpcClient interface {
@@ -31,7 +32,10 @@ type RpcClientConfig struct {
 	// Id is useful to identify the client in metrics
 	Id string
 
-	// MaxConcurrency is the maximum number of concurrent requests to the RPC server (0 = no limit)
+	// RateLimit is the maximum number of requests per second to the RPC. If a request exceeds the rate limit, it will either be routed to another available RPC, or queued until the rate limit capacity allows. (0 = no limit)
+	RateLimit uint64
+
+	// MaxConcurrency is the maximum number of concurrent requests to the RPC server. If a request exceeds the max concurrency, it will either be routed to another available RPC, or queued until the max concurrency capacity allows. (0 = no limit)
 	MaxConcurrency uint64
 
 	// PrometheusRegisterer is used to register metrics with Prometheus
@@ -41,6 +45,7 @@ type RpcClientConfig struct {
 type RpcClient struct {
 	id      string
 	c       *rpc.Client
+	lim     *rate.Limiter
 	sem     *semaphore.Weighted
 	metrics *Metrics
 }
@@ -60,6 +65,11 @@ func DialContext(ctx context.Context, url string, cfg *RpcClientConfig) (*RpcCli
 		id = cfg.Id
 	}
 
+	var lim *rate.Limiter
+	if cfg != nil && cfg.RateLimit > 0 {
+		lim = rate.NewLimiter(rate.Limit(cfg.RateLimit), int(cfg.RateLimit))
+	}
+
 	var sem *semaphore.Weighted
 	if cfg != nil && cfg.MaxConcurrency > 0 {
 		sem = semaphore.NewWeighted(int64(cfg.MaxConcurrency))
@@ -73,26 +83,10 @@ func DialContext(ctx context.Context, url string, cfg *RpcClientConfig) (*RpcCli
 	return &RpcClient{
 		id:      id,
 		c:       c,
+		lim:     lim,
 		sem:     sem,
 		metrics: metrics,
 	}, nil
-}
-
-func (c *RpcClient) acquireSemaphore(ctx context.Context, weight int64) error {
-	if c.sem == nil {
-		return nil
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	return c.sem.Acquire(ctx, weight)
-}
-
-func (c *RpcClient) releaseSemaphore(weight int64) {
-	if c.sem == nil {
-		return
-	}
-	c.sem.Release(weight)
 }
 
 func (c *RpcClient) BatchCall(b []rpc.BatchElem) error {
@@ -110,13 +104,14 @@ func (c *RpcClient) BatchCallContext(ctx context.Context, b []rpc.BatchElem) err
 }
 
 func (c *RpcClient) _batchCallContext(ctx context.Context, b []rpc.BatchElem) error {
-	if err := c.acquireSemaphore(ctx, 1); err != nil {
+	done, err := c.applyRateLimit(ctx)
+	if err != nil {
 		return err
 	}
-	defer c.releaseSemaphore(1)
+	defer done()
 
 	start := time.Now()
-	err := c.c.BatchCallContext(ctx, b)
+	err = c.c.BatchCallContext(ctx, b)
 
 	if c.metrics != nil {
 		c.metrics.RpcCallsDuration.WithLabelValues(c.id, "BatchCall").Observe(time.Since(start).Seconds())
@@ -146,13 +141,14 @@ func (c *RpcClient) CallContext(ctx context.Context, result interface{}, method 
 }
 
 func (c *RpcClient) _callContext(ctx context.Context, result interface{}, method string, args ...interface{}) error {
-	if err := c.acquireSemaphore(ctx, 1); err != nil {
+	done, err := c.applyRateLimit(ctx)
+	if err != nil {
 		return err
 	}
-	defer c.releaseSemaphore(1)
+	defer done()
 
 	start := time.Now()
-	err := c.c.CallContext(ctx, result, method, args...)
+	err = c.c.CallContext(ctx, result, method, args...)
 
 	if c.metrics != nil {
 		c.metrics.RpcCallsDuration.WithLabelValues(c.id, method).Observe(time.Since(start).Seconds())
@@ -194,10 +190,11 @@ func (c *RpcClient) Subscribe(ctx context.Context, namespace string, channel int
 }
 
 func (c *RpcClient) _subscribe(ctx context.Context, namespace string, channel interface{}, args ...interface{}) (*rpc.ClientSubscription, error) {
-	if err := c.acquireSemaphore(ctx, 1); err != nil {
+	done, err := c.applyRateLimit(ctx)
+	if err != nil {
 		return nil, err
 	}
-	defer c.releaseSemaphore(1)
+	defer done()
 
 	start := time.Now()
 	sub, err := c.c.Subscribe(ctx, namespace, channel, args...)
@@ -219,13 +216,14 @@ func (c *RpcClient) Notify(ctx context.Context, method string, args ...interface
 		c.metrics.ClientFunctionsCalls.WithLabelValues(c.id, "Notify").Inc()
 	}
 
-	if err := c.acquireSemaphore(ctx, 1); err != nil {
+	done, err := c.applyRateLimit(ctx)
+	if err != nil {
 		return err
 	}
-	defer c.releaseSemaphore(1)
+	defer done()
 
 	start := time.Now()
-	err := c.c.Notify(ctx, method, args...)
+	err = c.c.Notify(ctx, method, args...)
 
 	if c.metrics != nil {
 		c.metrics.RpcCallsDuration.WithLabelValues(c.id, method).Observe(time.Since(start).Seconds())
@@ -259,10 +257,11 @@ func (c *RpcClient) SupportedModules() (map[string]string, error) {
 		c.metrics.ClientFunctionsCalls.WithLabelValues(c.id, "SupportedModules").Inc()
 	}
 
-	if err := c.acquireSemaphore(context.Background(), 1); err != nil {
+	done, err := c.applyRateLimit(context.Background())
+	if err != nil {
 		return nil, err
 	}
-	defer c.releaseSemaphore(1)
+	defer done()
 
 	start := time.Now()
 	modules, err := c.c.SupportedModules()
