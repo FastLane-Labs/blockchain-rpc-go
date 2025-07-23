@@ -41,7 +41,7 @@ func newMetrics(reg prometheus.Registerer) *Metrics {
 		Errors: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "blockchain_rpc_go_rpc_errors",
 			Help: "Number of times an RPC method returns an error",
-		}, []string{"id", "method", "error"}),
+		}, []string{"id", "method"}),
 
 		RpcCallsDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "blockchain_rpc_go_rpc_calls_duration",

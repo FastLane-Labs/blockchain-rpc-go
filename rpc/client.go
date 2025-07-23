@@ -118,7 +118,7 @@ func (c *RpcClient) _batchCallContext(ctx context.Context, b []rpc.BatchElem) er
 		for _, elem := range b {
 			c.metrics.RpcMethodsCalls.WithLabelValues(c.id, elem.Method).Inc()
 			if elem.Error != nil {
-				c.metrics.Errors.WithLabelValues(c.id, elem.Method, elem.Error.Error()).Inc()
+				c.metrics.Errors.WithLabelValues(c.id, elem.Method).Inc()
 			}
 		}
 	}
@@ -154,7 +154,7 @@ func (c *RpcClient) _callContext(ctx context.Context, result interface{}, method
 		c.metrics.RpcCallsDuration.WithLabelValues(c.id, method).Observe(time.Since(start).Seconds())
 		c.metrics.RpcMethodsCalls.WithLabelValues(c.id, method).Inc()
 		if err != nil {
-			c.metrics.Errors.WithLabelValues(c.id, method, err.Error()).Inc()
+			c.metrics.Errors.WithLabelValues(c.id, method).Inc()
 		}
 	}
 
@@ -204,7 +204,7 @@ func (c *RpcClient) _subscribe(ctx context.Context, namespace string, channel in
 		c.metrics.RpcCallsDuration.WithLabelValues(c.id, method).Observe(time.Since(start).Seconds())
 		c.metrics.RpcMethodsCalls.WithLabelValues(c.id, method).Inc()
 		if err != nil {
-			c.metrics.Errors.WithLabelValues(c.id, method, err.Error()).Inc()
+			c.metrics.Errors.WithLabelValues(c.id, method).Inc()
 		}
 	}
 
@@ -229,7 +229,7 @@ func (c *RpcClient) Notify(ctx context.Context, method string, args ...interface
 		c.metrics.RpcCallsDuration.WithLabelValues(c.id, method).Observe(time.Since(start).Seconds())
 		c.metrics.RpcMethodsCalls.WithLabelValues(c.id, method).Inc()
 		if err != nil {
-			c.metrics.Errors.WithLabelValues(c.id, method, err.Error()).Inc()
+			c.metrics.Errors.WithLabelValues(c.id, method).Inc()
 		}
 	}
 
@@ -270,7 +270,7 @@ func (c *RpcClient) SupportedModules() (map[string]string, error) {
 		c.metrics.RpcCallsDuration.WithLabelValues(c.id, "rpc_modules").Observe(time.Since(start).Seconds())
 		c.metrics.RpcMethodsCalls.WithLabelValues(c.id, "rpc_modules").Inc()
 		if err != nil {
-			c.metrics.Errors.WithLabelValues(c.id, "rpc_modules", err.Error()).Inc()
+			c.metrics.Errors.WithLabelValues(c.id, "rpc_modules").Inc()
 		}
 	}
 
