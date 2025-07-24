@@ -12,31 +12,8 @@ import (
 	"golang.org/x/time/rate"
 )
 
-type IRpcClient interface {
-	BatchCall(b []rpc.BatchElem) error
-	BatchCallContext(ctx context.Context, b []rpc.BatchElem) error
-	Call(result interface{}, method string, args ...interface{}) error
-	CallContext(ctx context.Context, result interface{}, method string, args ...interface{}) error
-	Close()
-	EthSubscribe(ctx context.Context, channel interface{}, args ...interface{}) (*rpc.ClientSubscription, error)
-	Notify(ctx context.Context, method string, args ...interface{}) error
-	RegisterName(name string, receiver interface{}) error
-	SetHeader(key string, value string)
-	ShhSubscribe(ctx context.Context, channel interface{}, args ...interface{}) (*rpc.ClientSubscription, error)
-	Subscribe(ctx context.Context, namespace string, channel interface{}, args ...interface{}) (*rpc.ClientSubscription, error)
-	SupportedModules() (map[string]string, error)
-	SupportsSubscriptions() bool
-}
-
 type RpcClientConfig struct {
-	// Id is useful to identify the client in metrics
-	Id string
-
-	// RateLimit is the maximum number of requests per second to the RPC. If a request exceeds the rate limit, it will either be routed to another available RPC, or queued until the rate limit capacity allows. (0 = no limit)
-	RateLimit uint64
-
-	// MaxConcurrency is the maximum number of concurrent requests to the RPC server. If a request exceeds the max concurrency, it will either be routed to another available RPC, or queued until the max concurrency capacity allows. (0 = no limit)
-	MaxConcurrency uint64
+	RpcClientData
 
 	// PrometheusRegisterer is used to register metrics with Prometheus
 	PrometheusRegisterer prometheus.Registerer
@@ -47,15 +24,16 @@ type RpcClient struct {
 	c       *rpc.Client
 	lim     *rate.Limiter
 	sem     *semaphore.Weighted
+	weight  uint64
 	metrics *Metrics
 }
 
-func Dial(url string, cfg *RpcClientConfig) (*RpcClient, error) {
-	return DialContext(context.Background(), url, cfg)
+func Dial(cfg *RpcClientConfig) (*RpcClient, error) {
+	return DialContext(context.Background(), cfg)
 }
 
-func DialContext(ctx context.Context, url string, cfg *RpcClientConfig) (*RpcClient, error) {
-	c, err := rpc.DialContext(ctx, url)
+func DialContext(ctx context.Context, cfg *RpcClientConfig) (*RpcClient, error) {
+	c, err := rpc.DialContext(ctx, cfg.Url)
 	if err != nil {
 		return nil, err
 	}
@@ -85,6 +63,7 @@ func DialContext(ctx context.Context, url string, cfg *RpcClientConfig) (*RpcCli
 		c:       c,
 		lim:     lim,
 		sem:     sem,
+		weight:  cfg.Weight,
 		metrics: metrics,
 	}, nil
 }
@@ -104,7 +83,7 @@ func (c *RpcClient) BatchCallContext(ctx context.Context, b []rpc.BatchElem) err
 }
 
 func (c *RpcClient) _batchCallContext(ctx context.Context, b []rpc.BatchElem) error {
-	done, err := c.applyRateLimit(ctx)
+	done, err := c.applyRateLimit(ctx, false)
 	if err != nil {
 		return err
 	}
@@ -126,22 +105,22 @@ func (c *RpcClient) _batchCallContext(ctx context.Context, b []rpc.BatchElem) er
 	return err
 }
 
-func (c *RpcClient) Call(result interface{}, method string, args ...interface{}) error {
+func (c *RpcClient) Call(result any, method string, args ...any) error {
 	if c.metrics != nil {
 		c.metrics.ClientFunctionsCalls.WithLabelValues(c.id, "Call").Inc()
 	}
 	return c._callContext(context.Background(), result, method, args...)
 }
 
-func (c *RpcClient) CallContext(ctx context.Context, result interface{}, method string, args ...interface{}) error {
+func (c *RpcClient) CallContext(ctx context.Context, result any, method string, args ...any) error {
 	if c.metrics != nil {
 		c.metrics.ClientFunctionsCalls.WithLabelValues(c.id, "CallContext").Inc()
 	}
 	return c._callContext(ctx, result, method, args...)
 }
 
-func (c *RpcClient) _callContext(ctx context.Context, result interface{}, method string, args ...interface{}) error {
-	done, err := c.applyRateLimit(ctx)
+func (c *RpcClient) _callContext(ctx context.Context, result any, method string, args ...any) error {
+	done, err := c.applyRateLimit(ctx, false)
 	if err != nil {
 		return err
 	}
@@ -168,29 +147,29 @@ func (c *RpcClient) Close() {
 	c.c.Close()
 }
 
-func (c *RpcClient) EthSubscribe(ctx context.Context, channel interface{}, args ...interface{}) (*rpc.ClientSubscription, error) {
+func (c *RpcClient) EthSubscribe(ctx context.Context, channel any, args ...any) (*rpc.ClientSubscription, error) {
 	if c.metrics != nil {
 		c.metrics.ClientFunctionsCalls.WithLabelValues(c.id, "EthSubscribe").Inc()
 	}
 	return c._subscribe(ctx, "eth", channel, args...)
 }
 
-func (c *RpcClient) ShhSubscribe(ctx context.Context, channel interface{}, args ...interface{}) (*rpc.ClientSubscription, error) {
+func (c *RpcClient) ShhSubscribe(ctx context.Context, channel any, args ...any) (*rpc.ClientSubscription, error) {
 	if c.metrics != nil {
 		c.metrics.ClientFunctionsCalls.WithLabelValues(c.id, "ShhSubscribe").Inc()
 	}
 	return c._subscribe(ctx, "shh", channel, args...)
 }
 
-func (c *RpcClient) Subscribe(ctx context.Context, namespace string, channel interface{}, args ...interface{}) (*rpc.ClientSubscription, error) {
+func (c *RpcClient) Subscribe(ctx context.Context, namespace string, channel any, args ...any) (*rpc.ClientSubscription, error) {
 	if c.metrics != nil {
 		c.metrics.ClientFunctionsCalls.WithLabelValues(c.id, "Subscribe").Inc()
 	}
 	return c._subscribe(ctx, namespace, channel, args...)
 }
 
-func (c *RpcClient) _subscribe(ctx context.Context, namespace string, channel interface{}, args ...interface{}) (*rpc.ClientSubscription, error) {
-	done, err := c.applyRateLimit(ctx)
+func (c *RpcClient) _subscribe(ctx context.Context, namespace string, channel any, args ...any) (*rpc.ClientSubscription, error) {
+	done, err := c.applyRateLimit(ctx, false)
 	if err != nil {
 		return nil, err
 	}
@@ -211,12 +190,12 @@ func (c *RpcClient) _subscribe(ctx context.Context, namespace string, channel in
 	return sub, err
 }
 
-func (c *RpcClient) Notify(ctx context.Context, method string, args ...interface{}) error {
+func (c *RpcClient) Notify(ctx context.Context, method string, args ...any) error {
 	if c.metrics != nil {
 		c.metrics.ClientFunctionsCalls.WithLabelValues(c.id, "Notify").Inc()
 	}
 
-	done, err := c.applyRateLimit(ctx)
+	done, err := c.applyRateLimit(ctx, false)
 	if err != nil {
 		return err
 	}
@@ -236,7 +215,7 @@ func (c *RpcClient) Notify(ctx context.Context, method string, args ...interface
 	return err
 }
 
-func (c *RpcClient) RegisterName(name string, receiver interface{}) error {
+func (c *RpcClient) RegisterName(name string, receiver any) error {
 	if c.metrics != nil {
 		c.metrics.ClientFunctionsCalls.WithLabelValues(c.id, "RegisterName").Inc()
 	}
@@ -257,7 +236,7 @@ func (c *RpcClient) SupportedModules() (map[string]string, error) {
 		c.metrics.ClientFunctionsCalls.WithLabelValues(c.id, "SupportedModules").Inc()
 	}
 
-	done, err := c.applyRateLimit(context.Background())
+	done, err := c.applyRateLimit(context.Background(), false)
 	if err != nil {
 		return nil, err
 	}
