@@ -3,6 +3,7 @@ package rpc
 import (
 	"context"
 	"errors"
+	"math"
 )
 
 const (
@@ -37,6 +38,8 @@ func (c *RpcClient) applyRateLimit(ctx context.Context, nonBlocking bool) (done 
 		ctx = context.Background()
 	}
 
+	c.queued.Add(1)
+
 	if err := c.advanceLimiter(ctx, nonBlocking); err != nil {
 		return nil, err
 	}
@@ -47,6 +50,7 @@ func (c *RpcClient) applyRateLimit(ctx context.Context, nonBlocking bool) (done 
 
 	return func() {
 		c.releaseSemaphore(defaultSemaphoreWeight)
+		c.queued.Add(^uint64(0))
 	}, nil
 }
 
@@ -92,4 +96,29 @@ func (c *RpcClient) releaseSemaphore(weight int64) {
 	}
 
 	c.sem.Release(weight)
+}
+
+func clientRateLimitScore(client *RpcClient) float64 {
+	rateLimit := float64(10000) // default high value for unlimited
+	if client.lim != nil && client.lim.Limit() > 0 {
+		rateLimit = float64(client.lim.Limit())
+	}
+
+	currentQueueSize := float64(client.queued.Load())
+
+	// Calculate combined concurrency-queue score
+	var capacityScore float64
+	if client.maxConc > 0 {
+		// Capacity-to-demand ratio: how much processing capacity vs current demand
+		// Higher ratio = better (more capacity relative to queue pressure)
+		maxConcurrency := float64(client.maxConc)
+		capacityScore = maxConcurrency / (currentQueueSize + 1) * 100 // scale factor for normalization
+	} else {
+		// No concurrency limit - fall back to simple queue-based scoring
+		capacityScore = 1000 / (currentQueueSize + 1)
+	}
+
+	// Calculate throughput capacity score using geometric mean
+	// Balances rate limiting and capacity-to-demand ratio
+	return math.Sqrt(rateLimit * capacityScore)
 }

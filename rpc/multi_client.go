@@ -5,6 +5,7 @@ import (
 	"errors"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -71,14 +72,49 @@ func DialMultiContext(ctx context.Context, cfg *MultiRpcClientConfig) (*MultiRpc
 	}
 
 	slices.SortFunc(allClients, func(a, b *internalRpcClient) int {
-		if b.rpcClient.weight > a.rpcClient.weight {
+		if a.rpcClient.weight > b.rpcClient.weight {
 			return -1
 		}
-		if b.rpcClient.weight < a.rpcClient.weight {
+		if a.rpcClient.weight < b.rpcClient.weight {
 			return 1
 		}
 		return 0
 	})
+
+	var (
+		retries = 5
+		wg      sync.WaitGroup
+		errored uint64
+	)
+
+	for _, client := range allClients {
+		wg.Add(1)
+		go func(client *internalRpcClient) {
+			defer wg.Done()
+
+			for range retries {
+				ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+				err := client.rpcClient.CallContext(ctx, nil, "eth_chainId")
+				cancel()
+
+				if err != nil {
+					time.Sleep(1 * time.Second)
+					continue
+				}
+
+				client.enabled.Store(true)
+				return
+			}
+
+			atomic.AddUint64(&errored, 1)
+		}(client)
+	}
+
+	wg.Wait()
+
+	if errored == uint64(len(allClients)) {
+		return nil, ErrNoAvailableClients
+	}
 
 	c := &MultiRpcClient{
 		preferHttpForNonSubscriptionRelated: cfg.PreferHttpForNonSubscriptionRelated,
@@ -135,8 +171,12 @@ func (c *MultiRpcClient) getRpcClient(subscriptionRelated bool) (*internalRpcCli
 		return nonPreferredClients[0], nil
 	}
 
-	// Last choice: select first over-limit client, the request will be queued
+	// Last choice: select client with best rate limit score, the request will be queued
 	if len(candidatesOverLimits) > 0 {
+		slices.SortFunc(candidatesOverLimits, func(a, b *internalRpcClient) int {
+			return int(clientRateLimitScore(b.rpcClient) - clientRateLimitScore(a.rpcClient))
+		})
+
 		return candidatesOverLimits[0], nil
 	}
 

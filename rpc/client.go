@@ -3,6 +3,7 @@ package rpc
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum/rpc"
@@ -24,6 +25,8 @@ type RpcClient struct {
 	c       *rpc.Client
 	lim     *rate.Limiter
 	sem     *semaphore.Weighted
+	maxConc uint64
+	queued  atomic.Uint64
 	weight  uint64
 	metrics *Metrics
 }
@@ -63,6 +66,7 @@ func DialContext(ctx context.Context, cfg *RpcClientConfig) (*RpcClient, error) 
 		c:       c,
 		lim:     lim,
 		sem:     sem,
+		maxConc: cfg.MaxConcurrency,
 		weight:  cfg.Weight,
 		metrics: metrics,
 	}, nil
