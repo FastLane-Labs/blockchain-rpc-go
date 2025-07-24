@@ -42,6 +42,18 @@ type internalRpcClient struct {
 	enabled   atomic.Bool
 }
 
+func (c *internalRpcClient) setEnabled(enabled bool) {
+	c.enabled.Store(enabled)
+
+	if c.rpcClient.metrics != nil {
+		if enabled {
+			c.rpcClient.metrics.ClientEnabled.WithLabelValues(c.rpcClient.id).Set(1)
+		} else {
+			c.rpcClient.metrics.ClientEnabled.WithLabelValues(c.rpcClient.id).Set(0)
+		}
+	}
+}
+
 type MultiRpcClient struct {
 	preferHttpForNonSubscriptionRelated bool
 	healthCheckInterval                 time.Duration
@@ -102,7 +114,7 @@ func DialMultiContext(ctx context.Context, cfg *MultiRpcClientConfig) (*MultiRpc
 					continue
 				}
 
-				client.enabled.Store(true)
+				client.setEnabled(true)
 				return
 			}
 
@@ -208,7 +220,7 @@ func (c *MultiRpcClient) BatchCallContext(ctx context.Context, b []rpc.BatchElem
 		}
 
 		// Deactivate the client and retry with another
-		ic.enabled.Store(false)
+		ic.setEnabled(false)
 		return c.BatchCallContext(ctx, b)
 	}
 
@@ -231,7 +243,7 @@ func (c *MultiRpcClient) CallContext(ctx context.Context, result any, method str
 		}
 
 		// Deactivate the client and retry with another
-		ic.enabled.Store(false)
+		ic.setEnabled(false)
 		return c.CallContext(ctx, result, method, args...)
 	}
 
@@ -272,7 +284,7 @@ func (c *MultiRpcClient) Subscribe(ctx context.Context, namespace string, channe
 		}
 
 		// Deactivate the client and retry with another
-		ic.enabled.Store(false)
+		ic.setEnabled(false)
 		return c.Subscribe(ctx, namespace, channel, args...)
 	}
 
@@ -291,7 +303,7 @@ func (c *MultiRpcClient) Notify(ctx context.Context, method string, args ...any)
 		}
 
 		// Deactivate the client and retry with another
-		ic.enabled.Store(false)
+		ic.setEnabled(false)
 		return c.Notify(ctx, method, args...)
 	}
 

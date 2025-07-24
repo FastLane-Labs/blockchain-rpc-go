@@ -36,7 +36,7 @@ func (c *MultiRpcClient) healthCheckLoopSingle(client *internalRpcClient) {
 		err := client.rpcClient.CallContext(ctx, nil, "eth_chainId")
 		cancel()
 
-		client.enabled.Store(err == nil)
+		client.setEnabled(err == nil)
 
 		select {
 		case <-c.stopped:
