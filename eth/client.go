@@ -63,12 +63,25 @@ type EthClient struct {
 	c brpc.IRpcClient
 }
 
-func Dial(url string, cfg *brpc.RpcClientConfig) (*EthClient, error) {
-	return DialContext(context.Background(), url, cfg)
+func Dial(cfg *brpc.RpcClientConfig) (*EthClient, error) {
+	return DialContext(context.Background(), cfg)
 }
 
-func DialContext(ctx context.Context, url string, cfg *brpc.RpcClientConfig) (*EthClient, error) {
-	c, err := brpc.DialContext(ctx, url, cfg)
+func DialContext(ctx context.Context, cfg *brpc.RpcClientConfig) (*EthClient, error) {
+	c, err := brpc.DialContext(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	return &EthClient{c: c}, nil
+}
+
+func DialMulti(cfg *brpc.MultiRpcClientConfig) (*EthClient, error) {
+	return DialMultiContext(context.Background(), cfg)
+}
+
+func DialMultiContext(ctx context.Context, cfg *brpc.MultiRpcClientConfig) (*EthClient, error) {
+	c, err := brpc.DialMultiContext(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -146,7 +159,7 @@ type rpcBlock struct {
 	Withdrawals  []*types.Withdrawal `json:"withdrawals,omitempty"`
 }
 
-func (ec *EthClient) getBlock(ctx context.Context, method string, args ...interface{}) (*types.Block, error) {
+func (ec *EthClient) getBlock(ctx context.Context, method string, args ...any) (*types.Block, error) {
 	var raw json.RawMessage
 	err := ec.c.CallContext(ctx, &raw, method, args...)
 	if err != nil {
@@ -188,7 +201,7 @@ func (ec *EthClient) getBlock(ctx context.Context, method string, args ...interf
 		for i := range reqs {
 			reqs[i] = rpc.BatchElem{
 				Method: "eth_getUncleByBlockHashAndIndex",
-				Args:   []interface{}{body.Hash, hexutil.EncodeUint64(uint64(i))},
+				Args:   []any{body.Hash, hexutil.EncodeUint64(uint64(i))},
 				Result: &uncles[i],
 			}
 		}
@@ -475,8 +488,8 @@ func (ec *EthClient) SubscribeFilterLogs(ctx context.Context, q ethereum.FilterQ
 	return sub, nil
 }
 
-func toFilterArg(q ethereum.FilterQuery) (interface{}, error) {
-	arg := map[string]interface{}{
+func toFilterArg(q ethereum.FilterQuery) (any, error) {
+	arg := map[string]any{
 		"address": q.Addresses,
 		"topics":  q.Topics,
 	}
@@ -665,8 +678,8 @@ func toBlockNumArg(number *big.Int) string {
 	return fmt.Sprintf("<invalid %d>", number)
 }
 
-func toCallArg(msg ethereum.CallMsg) interface{} {
-	arg := map[string]interface{}{
+func toCallArg(msg ethereum.CallMsg) any {
+	arg := map[string]any{
 		"from": msg.From,
 		"to":   msg.To,
 	}

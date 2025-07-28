@@ -7,6 +7,7 @@ require (
 	github.com/google/uuid v1.3.0
 	github.com/prometheus/client_golang v1.12.0
 	golang.org/x/sync v0.7.0
+	golang.org/x/time v0.5.0
 )
 
 require (

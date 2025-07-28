@@ -13,6 +13,7 @@ var (
 )
 
 type Metrics struct {
+	ClientEnabled        *prometheus.GaugeVec
 	ClientFunctionsCalls *prometheus.CounterVec
 	RpcMethodsCalls      *prometheus.CounterVec
 	Errors               *prometheus.CounterVec
@@ -28,6 +29,11 @@ func getMetrics(reg prometheus.Registerer) *Metrics {
 
 func newMetrics(reg prometheus.Registerer) *Metrics {
 	m := &Metrics{
+		ClientEnabled: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "blockchain_rpc_go_client_enabled",
+			Help: "Whether a client is enabled",
+		}, []string{"id"}),
+
 		ClientFunctionsCalls: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "blockchain_rpc_go_client_functions_calls",
 			Help: "Number of times a client function is called",
@@ -41,7 +47,7 @@ func newMetrics(reg prometheus.Registerer) *Metrics {
 		Errors: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "blockchain_rpc_go_rpc_errors",
 			Help: "Number of times an RPC method returns an error",
-		}, []string{"id", "method", "error"}),
+		}, []string{"id", "method"}),
 
 		RpcCallsDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "blockchain_rpc_go_rpc_calls_duration",
@@ -51,6 +57,7 @@ func newMetrics(reg prometheus.Registerer) *Metrics {
 	}
 
 	reg.MustRegister(
+		m.ClientEnabled,
 		m.ClientFunctionsCalls,
 		m.RpcMethodsCalls,
 		m.Errors,
