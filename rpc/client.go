@@ -73,15 +73,15 @@ func DialContext(ctx context.Context, cfg *RpcClientConfig) (*RpcClient, error) 
 }
 
 func (c *RpcClient) BatchCall(b []rpc.BatchElem) error {
-	if c.metrics != nil {
-		c.metrics.ClientFunctionsCalls.WithLabelValues(c.id, "BatchCall").Inc()
+	if c.metrics != nil && c.metrics.AsyncRecorder != nil {
+		c.metrics.AsyncRecorder.RecordCounterInc(MetricKeyClientFunctionsCalls, c.id, "BatchCall")
 	}
 	return c._batchCallContext(context.Background(), b)
 }
 
 func (c *RpcClient) BatchCallContext(ctx context.Context, b []rpc.BatchElem) error {
-	if c.metrics != nil {
-		c.metrics.ClientFunctionsCalls.WithLabelValues(c.id, "BatchCallContext").Inc()
+	if c.metrics != nil && c.metrics.AsyncRecorder != nil {
+		c.metrics.AsyncRecorder.RecordCounterInc(MetricKeyClientFunctionsCalls, c.id, "BatchCallContext")
 	}
 	return c._batchCallContext(ctx, b)
 }
@@ -96,12 +96,14 @@ func (c *RpcClient) _batchCallContext(ctx context.Context, b []rpc.BatchElem) er
 	start := time.Now()
 	err = c.c.BatchCallContext(ctx, b)
 
-	if c.metrics != nil {
-		c.metrics.RpcCallsDuration.WithLabelValues(c.id, "BatchCall").Observe(time.Since(start).Seconds())
+	if c.metrics != nil && c.metrics.AsyncRecorder != nil {
+		duration := time.Since(start).Seconds()
+		c.metrics.AsyncRecorder.RecordHistogramObserve(MetricKeyRpcCallsDuration, duration, c.id, "BatchCall")
+
 		for _, elem := range b {
-			c.metrics.RpcMethodsCalls.WithLabelValues(c.id, elem.Method).Inc()
+			c.metrics.AsyncRecorder.RecordCounterInc(MetricKeyRpcMethodsCalls, c.id, elem.Method)
 			if elem.Error != nil {
-				c.metrics.Errors.WithLabelValues(c.id, elem.Method).Inc()
+				c.metrics.AsyncRecorder.RecordCounterInc(MetricKeyErrors, c.id, elem.Method)
 			}
 		}
 	}
@@ -110,15 +112,15 @@ func (c *RpcClient) _batchCallContext(ctx context.Context, b []rpc.BatchElem) er
 }
 
 func (c *RpcClient) Call(result any, method string, args ...any) error {
-	if c.metrics != nil {
-		c.metrics.ClientFunctionsCalls.WithLabelValues(c.id, "Call").Inc()
+	if c.metrics != nil && c.metrics.AsyncRecorder != nil {
+		c.metrics.AsyncRecorder.RecordCounterInc(MetricKeyClientFunctionsCalls, c.id, "Call")
 	}
 	return c._callContext(context.Background(), result, method, args...)
 }
 
 func (c *RpcClient) CallContext(ctx context.Context, result any, method string, args ...any) error {
-	if c.metrics != nil {
-		c.metrics.ClientFunctionsCalls.WithLabelValues(c.id, "CallContext").Inc()
+	if c.metrics != nil && c.metrics.AsyncRecorder != nil {
+		c.metrics.AsyncRecorder.RecordCounterInc(MetricKeyClientFunctionsCalls, c.id, "CallContext")
 	}
 	return c._callContext(ctx, result, method, args...)
 }
@@ -133,11 +135,12 @@ func (c *RpcClient) _callContext(ctx context.Context, result any, method string,
 	start := time.Now()
 	err = c.c.CallContext(ctx, result, method, args...)
 
-	if c.metrics != nil {
-		c.metrics.RpcCallsDuration.WithLabelValues(c.id, method).Observe(time.Since(start).Seconds())
-		c.metrics.RpcMethodsCalls.WithLabelValues(c.id, method).Inc()
+	if c.metrics != nil && c.metrics.AsyncRecorder != nil {
+		duration := time.Since(start).Seconds()
+		c.metrics.AsyncRecorder.RecordHistogramObserve(MetricKeyRpcCallsDuration, duration, c.id, method)
+		c.metrics.AsyncRecorder.RecordCounterInc(MetricKeyRpcMethodsCalls, c.id, method)
 		if err != nil {
-			c.metrics.Errors.WithLabelValues(c.id, method).Inc()
+			c.metrics.AsyncRecorder.RecordCounterInc(MetricKeyErrors, c.id, method)
 		}
 	}
 
@@ -145,29 +148,29 @@ func (c *RpcClient) _callContext(ctx context.Context, result any, method string,
 }
 
 func (c *RpcClient) Close() {
-	if c.metrics != nil {
-		c.metrics.ClientFunctionsCalls.WithLabelValues(c.id, "Close").Inc()
+	if c.metrics != nil && c.metrics.AsyncRecorder != nil {
+		c.metrics.AsyncRecorder.RecordCounterInc(MetricKeyClientFunctionsCalls, c.id, "Close")
 	}
 	c.c.Close()
 }
 
 func (c *RpcClient) EthSubscribe(ctx context.Context, channel any, args ...any) (*rpc.ClientSubscription, error) {
-	if c.metrics != nil {
-		c.metrics.ClientFunctionsCalls.WithLabelValues(c.id, "EthSubscribe").Inc()
+	if c.metrics != nil && c.metrics.AsyncRecorder != nil {
+		c.metrics.AsyncRecorder.RecordCounterInc(MetricKeyClientFunctionsCalls, c.id, "EthSubscribe")
 	}
 	return c._subscribe(ctx, "eth", channel, args...)
 }
 
 func (c *RpcClient) ShhSubscribe(ctx context.Context, channel any, args ...any) (*rpc.ClientSubscription, error) {
-	if c.metrics != nil {
-		c.metrics.ClientFunctionsCalls.WithLabelValues(c.id, "ShhSubscribe").Inc()
+	if c.metrics != nil && c.metrics.AsyncRecorder != nil {
+		c.metrics.AsyncRecorder.RecordCounterInc(MetricKeyClientFunctionsCalls, c.id, "ShhSubscribe")
 	}
 	return c._subscribe(ctx, "shh", channel, args...)
 }
 
 func (c *RpcClient) Subscribe(ctx context.Context, namespace string, channel any, args ...any) (*rpc.ClientSubscription, error) {
-	if c.metrics != nil {
-		c.metrics.ClientFunctionsCalls.WithLabelValues(c.id, "Subscribe").Inc()
+	if c.metrics != nil && c.metrics.AsyncRecorder != nil {
+		c.metrics.AsyncRecorder.RecordCounterInc(MetricKeyClientFunctionsCalls, c.id, "Subscribe")
 	}
 	return c._subscribe(ctx, namespace, channel, args...)
 }
@@ -182,12 +185,13 @@ func (c *RpcClient) _subscribe(ctx context.Context, namespace string, channel an
 	start := time.Now()
 	sub, err := c.c.Subscribe(ctx, namespace, channel, args...)
 
-	if c.metrics != nil {
+	if c.metrics != nil && c.metrics.AsyncRecorder != nil {
 		method := fmt.Sprintf("%s_subscribe", namespace)
-		c.metrics.RpcCallsDuration.WithLabelValues(c.id, method).Observe(time.Since(start).Seconds())
-		c.metrics.RpcMethodsCalls.WithLabelValues(c.id, method).Inc()
+		duration := time.Since(start).Seconds()
+		c.metrics.AsyncRecorder.RecordHistogramObserve(MetricKeyRpcCallsDuration, duration, c.id, method)
+		c.metrics.AsyncRecorder.RecordCounterInc(MetricKeyRpcMethodsCalls, c.id, method)
 		if err != nil {
-			c.metrics.Errors.WithLabelValues(c.id, method).Inc()
+			c.metrics.AsyncRecorder.RecordCounterInc(MetricKeyErrors, c.id, method)
 		}
 	}
 
@@ -195,8 +199,8 @@ func (c *RpcClient) _subscribe(ctx context.Context, namespace string, channel an
 }
 
 func (c *RpcClient) Notify(ctx context.Context, method string, args ...any) error {
-	if c.metrics != nil {
-		c.metrics.ClientFunctionsCalls.WithLabelValues(c.id, "Notify").Inc()
+	if c.metrics != nil && c.metrics.AsyncRecorder != nil {
+		c.metrics.AsyncRecorder.RecordCounterInc(MetricKeyClientFunctionsCalls, c.id, "Notify")
 	}
 
 	done, err := c.applyRateLimit(ctx, false)
@@ -208,11 +212,12 @@ func (c *RpcClient) Notify(ctx context.Context, method string, args ...any) erro
 	start := time.Now()
 	err = c.c.Notify(ctx, method, args...)
 
-	if c.metrics != nil {
-		c.metrics.RpcCallsDuration.WithLabelValues(c.id, method).Observe(time.Since(start).Seconds())
-		c.metrics.RpcMethodsCalls.WithLabelValues(c.id, method).Inc()
+	if c.metrics != nil && c.metrics.AsyncRecorder != nil {
+		duration := time.Since(start).Seconds()
+		c.metrics.AsyncRecorder.RecordHistogramObserve(MetricKeyRpcCallsDuration, duration, c.id, method)
+		c.metrics.AsyncRecorder.RecordCounterInc(MetricKeyRpcMethodsCalls, c.id, method)
 		if err != nil {
-			c.metrics.Errors.WithLabelValues(c.id, method).Inc()
+			c.metrics.AsyncRecorder.RecordCounterInc(MetricKeyErrors, c.id, method)
 		}
 	}
 
@@ -220,24 +225,24 @@ func (c *RpcClient) Notify(ctx context.Context, method string, args ...any) erro
 }
 
 func (c *RpcClient) RegisterName(name string, receiver any) error {
-	if c.metrics != nil {
-		c.metrics.ClientFunctionsCalls.WithLabelValues(c.id, "RegisterName").Inc()
+	if c.metrics != nil && c.metrics.AsyncRecorder != nil {
+		c.metrics.AsyncRecorder.RecordCounterInc(MetricKeyClientFunctionsCalls, c.id, "RegisterName")
 	}
 
 	return c.c.RegisterName(name, receiver)
 }
 
 func (c *RpcClient) SetHeader(key string, value string) {
-	if c.metrics != nil {
-		c.metrics.ClientFunctionsCalls.WithLabelValues(c.id, "SetHeader").Inc()
+	if c.metrics != nil && c.metrics.AsyncRecorder != nil {
+		c.metrics.AsyncRecorder.RecordCounterInc(MetricKeyClientFunctionsCalls, c.id, "SetHeader")
 	}
 
 	c.c.SetHeader(key, value)
 }
 
 func (c *RpcClient) SupportedModules() (map[string]string, error) {
-	if c.metrics != nil {
-		c.metrics.ClientFunctionsCalls.WithLabelValues(c.id, "SupportedModules").Inc()
+	if c.metrics != nil && c.metrics.AsyncRecorder != nil {
+		c.metrics.AsyncRecorder.RecordCounterInc(MetricKeyClientFunctionsCalls, c.id, "SupportedModules")
 	}
 
 	done, err := c.applyRateLimit(context.Background(), false)
@@ -249,11 +254,12 @@ func (c *RpcClient) SupportedModules() (map[string]string, error) {
 	start := time.Now()
 	modules, err := c.c.SupportedModules()
 
-	if c.metrics != nil {
-		c.metrics.RpcCallsDuration.WithLabelValues(c.id, "rpc_modules").Observe(time.Since(start).Seconds())
-		c.metrics.RpcMethodsCalls.WithLabelValues(c.id, "rpc_modules").Inc()
+	if c.metrics != nil && c.metrics.AsyncRecorder != nil {
+		duration := time.Since(start).Seconds()
+		c.metrics.AsyncRecorder.RecordHistogramObserve(MetricKeyRpcCallsDuration, duration, c.id, "rpc_modules")
+		c.metrics.AsyncRecorder.RecordCounterInc(MetricKeyRpcMethodsCalls, c.id, "rpc_modules")
 		if err != nil {
-			c.metrics.Errors.WithLabelValues(c.id, "rpc_modules").Inc()
+			c.metrics.AsyncRecorder.RecordCounterInc(MetricKeyErrors, c.id, "rpc_modules")
 		}
 	}
 
@@ -261,8 +267,8 @@ func (c *RpcClient) SupportedModules() (map[string]string, error) {
 }
 
 func (c *RpcClient) SupportsSubscriptions() bool {
-	if c.metrics != nil {
-		c.metrics.ClientFunctionsCalls.WithLabelValues(c.id, "SupportsSubscriptions").Inc()
+	if c.metrics != nil && c.metrics.AsyncRecorder != nil {
+		c.metrics.AsyncRecorder.RecordCounterInc(MetricKeyClientFunctionsCalls, c.id, "SupportsSubscriptions")
 	}
 
 	return c.c.SupportsSubscriptions()

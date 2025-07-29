@@ -45,11 +45,11 @@ type internalRpcClient struct {
 func (c *internalRpcClient) setEnabled(enabled bool) {
 	c.enabled.Store(enabled)
 
-	if c.rpcClient.metrics != nil {
+	if c.rpcClient.metrics != nil && c.rpcClient.metrics.AsyncRecorder != nil {
 		if enabled {
-			c.rpcClient.metrics.ClientEnabled.WithLabelValues(c.rpcClient.id).Set(1)
+			c.rpcClient.metrics.AsyncRecorder.RecordGaugeSet(MetricKeyClientEnabled, 1, c.rpcClient.id)
 		} else {
-			c.rpcClient.metrics.ClientEnabled.WithLabelValues(c.rpcClient.id).Set(0)
+			c.rpcClient.metrics.AsyncRecorder.RecordGaugeSet(MetricKeyClientEnabled, 0, c.rpcClient.id)
 		}
 	}
 }
