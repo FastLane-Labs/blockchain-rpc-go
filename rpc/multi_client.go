@@ -3,6 +3,7 @@ package rpc
 import (
 	"context"
 	"errors"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -232,6 +233,11 @@ func (c *MultiRpcClient) Call(result any, method string, args ...any) error {
 }
 
 func (c *MultiRpcClient) CallContext(ctx context.Context, result any, method string, args ...any) error {
+	// Special handling for eth_sendRawTransaction: send to all clients in parallel
+	if method == "eth_sendRawTransaction" {
+		return c.callContextParallel(ctx, result, method, args...)
+	}
+
 	ic, err := c.getRpcClient(strings.HasSuffix(method, subscribeMethodSuffix))
 	if err != nil {
 		return err
@@ -248,6 +254,89 @@ func (c *MultiRpcClient) CallContext(ctx context.Context, result any, method str
 	}
 
 	return nil
+}
+
+// callContextParallel calls the method on all available clients in parallel
+// Returns the first successful response, or a combined error if all fail
+// This is specifically designed for eth_sendRawTransaction
+func (c *MultiRpcClient) callContextParallel(ctx context.Context, result any, method string, args ...any) error {
+	// Get all available clients
+	availableClients := make([]*internalRpcClient, 0)
+	for _, client := range c.allClients {
+		if client.enabled.Load() {
+			availableClients = append(availableClients, client)
+		}
+	}
+
+	if len(availableClients) == 0 {
+		return ErrNoAvailableClients
+	}
+
+	type callResult struct {
+		client      *internalRpcClient
+		resultValue reflect.Value
+		err         error
+	}
+
+	resultChan := make(chan callResult, len(availableClients))
+	var wg sync.WaitGroup
+
+	// Get the type of result to create separate instances for each goroutine
+	var resultType reflect.Type
+	if result != nil {
+		resultType = reflect.TypeOf(result).Elem()
+	}
+
+	// Launch parallel calls to all available clients
+	for _, ic := range availableClients {
+		wg.Add(1)
+		go func(ic *internalRpcClient) {
+			defer wg.Done()
+
+			var tempResult any
+			var tempResultValue reflect.Value
+
+			// Create a new instance of the result type for this goroutine
+			if result != nil {
+				tempResultValue = reflect.New(resultType)
+				tempResult = tempResultValue.Interface()
+			}
+
+			err := ic.rpcClient.CallContext(ctx, tempResult, method, args...)
+
+			resultChan <- callResult{
+				client:      ic,
+				resultValue: tempResultValue,
+				err:         err,
+			}
+		}(ic)
+	}
+
+	// Wait for all goroutines to complete and close the channel
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	// Process results as they come in
+	errorMessages := make([]string, 0)
+
+	for res := range resultChan {
+		if res.err == nil {
+			// Got a successful response! Copy it to result and return immediately
+			if result != nil {
+				reflect.ValueOf(result).Elem().Set(res.resultValue.Elem())
+			}
+			return nil
+		}
+
+		// This call failed, collect the error
+		errorMessages = append(errorMessages, res.client.rpcClient.id+": "+res.err.Error())
+	}
+
+	// All calls failed - create a combined error
+	combinedError := "all clients failed for " + method + ": " + strings.Join(errorMessages, "; ")
+	return errors.New(combinedError)
 }
 
 func (c *MultiRpcClient) Close() {
