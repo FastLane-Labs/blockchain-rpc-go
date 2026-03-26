@@ -13,6 +13,10 @@ const (
 func (c *MultiRpcClient) healthCheckLoop() {
 	// Running each client in a separate goroutine so they don't block each other
 	for _, client := range c.allClients {
+		// Send-only clients don't support health check reads, skip them
+		if client.rpcClient.sendOnly {
+			continue
+		}
 		go c.healthCheckLoopSingle(client)
 	}
 }
