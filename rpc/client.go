@@ -21,14 +21,15 @@ type RpcClientConfig struct {
 }
 
 type RpcClient struct {
-	id      string
-	c       *rpc.Client
-	lim     *rate.Limiter
-	sem     *semaphore.Weighted
-	maxConc uint64
-	queued  atomic.Uint64
-	weight  uint64
-	metrics *Metrics
+	id       string
+	c        *rpc.Client
+	lim      *rate.Limiter
+	sem      *semaphore.Weighted
+	maxConc  uint64
+	queued   atomic.Uint64
+	weight   uint64
+	sendOnly bool
+	metrics  *Metrics
 }
 
 func Dial(cfg *RpcClientConfig) (*RpcClient, error) {
@@ -62,13 +63,14 @@ func DialContext(ctx context.Context, cfg *RpcClientConfig) (*RpcClient, error) 
 	}
 
 	return &RpcClient{
-		id:      id,
-		c:       c,
-		lim:     lim,
-		sem:     sem,
-		maxConc: cfg.MaxConcurrency,
-		weight:  cfg.Weight,
-		metrics: metrics,
+		id:       id,
+		c:        c,
+		lim:      lim,
+		sem:      sem,
+		maxConc:  cfg.MaxConcurrency,
+		weight:   cfg.Weight,
+		sendOnly: cfg.SendOnly,
+		metrics:  metrics,
 	}, nil
 }
 

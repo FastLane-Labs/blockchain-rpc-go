@@ -98,9 +98,18 @@ func DialMultiContext(ctx context.Context, cfg *MultiRpcClientConfig) (*MultiRpc
 		retries = 5
 		wg      sync.WaitGroup
 		errored uint64
+		checked uint64
 	)
 
 	for _, client := range allClients {
+		// Send-only clients don't support reads, skip connectivity check
+		// and keep them always enabled for transaction broadcasting
+		if client.rpcClient.sendOnly {
+			client.setEnabled(true)
+			continue
+		}
+
+		checked++
 		wg.Add(1)
 		go func(client *internalRpcClient) {
 			defer wg.Done()
@@ -125,7 +134,7 @@ func DialMultiContext(ctx context.Context, cfg *MultiRpcClientConfig) (*MultiRpc
 
 	wg.Wait()
 
-	if errored == uint64(len(allClients)) {
+	if errored == checked {
 		return nil, ErrNoAvailableClients
 	}
 
@@ -146,6 +155,10 @@ func (c *MultiRpcClient) getRpcClient(subscriptionRelated bool) (*internalRpcCli
 
 	// Filter out clients that are not capable of handling the request
 	for _, client := range c.allClients {
+		if client.rpcClient.sendOnly {
+			continue
+		}
+
 		if !client.enabled.Load() {
 			continue
 		}
@@ -260,10 +273,10 @@ func (c *MultiRpcClient) CallContext(ctx context.Context, result any, method str
 // Returns the first successful response, or a combined error if all fail
 // This is specifically designed for eth_sendRawTransaction
 func (c *MultiRpcClient) callContextParallel(ctx context.Context, result any, method string, args ...any) error {
-	// Get all available clients
+	// Get all available clients (send-only clients are always included)
 	availableClients := make([]*internalRpcClient, 0)
 	for _, client := range c.allClients {
-		if client.enabled.Load() {
+		if client.enabled.Load() || client.rpcClient.sendOnly {
 			availableClients = append(availableClients, client)
 		}
 	}
@@ -401,6 +414,9 @@ func (c *MultiRpcClient) Notify(ctx context.Context, method string, args ...any)
 
 func (c *MultiRpcClient) RegisterName(name string, receiver any) error {
 	for _, client := range c.allClients {
+		if client.rpcClient.sendOnly {
+			continue
+		}
 		if err := client.rpcClient.RegisterName(name, receiver); err != nil {
 			return err
 		}
@@ -420,6 +436,9 @@ func (c *MultiRpcClient) SupportedModules() (map[string]string, error) {
 	supportedModules := make(map[string]string)
 
 	for _, client := range c.allClients {
+		if client.rpcClient.sendOnly {
+			continue
+		}
 		modules, err := client.rpcClient.SupportedModules()
 		if err != nil {
 			return nil, err

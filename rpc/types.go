@@ -21,6 +21,11 @@ type RpcClientData struct {
 
 	// Used in MultiRpcClient only. Higher weight means higher priority in the client selection
 	Weight uint64
+
+	// SendOnly marks this RPC as only supporting eth_sendRawTransaction.
+	// It will participate in parallel transaction broadcasting but will be
+	// excluded from all other operations (reads, subscriptions, batch calls, etc.)
+	SendOnly bool
 }
 
 type IRpcClient interface {
