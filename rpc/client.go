@@ -39,7 +39,7 @@ func Dial(cfg *RpcClientConfig) (*RpcClient, error) {
 func DialContext(ctx context.Context, cfg *RpcClientConfig) (*RpcClient, error) {
 	c, err := rpc.DialContext(ctx, cfg.Url)
 	if err != nil {
-		return nil, err
+		return nil, redactErrorURLs(err)
 	}
 
 	id := uuid.New().String()
@@ -91,7 +91,7 @@ func (c *RpcClient) BatchCallContext(ctx context.Context, b []rpc.BatchElem) err
 func (c *RpcClient) _batchCallContext(ctx context.Context, b []rpc.BatchElem) error {
 	done, err := c.applyRateLimit(ctx, false)
 	if err != nil {
-		return err
+		return redactErrorURLs(err)
 	}
 	defer done()
 
@@ -100,15 +100,18 @@ func (c *RpcClient) _batchCallContext(ctx context.Context, b []rpc.BatchElem) er
 
 	if c.metrics != nil {
 		c.metrics.RpcCallsDuration.WithLabelValues(c.id, "BatchCall").Observe(time.Since(start).Seconds())
-		for _, elem := range b {
-			c.metrics.RpcMethodsCalls.WithLabelValues(c.id, elem.Method).Inc()
-			if elem.Error != nil {
-				c.metrics.Errors.WithLabelValues(c.id, elem.Method).Inc()
+	}
+	for i := range b {
+		b[i].Error = redactErrorURLs(b[i].Error)
+		if c.metrics != nil {
+			c.metrics.RpcMethodsCalls.WithLabelValues(c.id, b[i].Method).Inc()
+			if b[i].Error != nil {
+				c.metrics.Errors.WithLabelValues(c.id, b[i].Method).Inc()
 			}
 		}
 	}
 
-	return err
+	return redactErrorURLs(err)
 }
 
 func (c *RpcClient) Call(result any, method string, args ...any) error {
@@ -128,7 +131,7 @@ func (c *RpcClient) CallContext(ctx context.Context, result any, method string, 
 func (c *RpcClient) _callContext(ctx context.Context, result any, method string, args ...any) error {
 	done, err := c.applyRateLimit(ctx, false)
 	if err != nil {
-		return err
+		return redactErrorURLs(err)
 	}
 	defer done()
 
@@ -143,7 +146,7 @@ func (c *RpcClient) _callContext(ctx context.Context, result any, method string,
 		}
 	}
 
-	return err
+	return redactErrorURLs(err)
 }
 
 func (c *RpcClient) Close() {
@@ -177,7 +180,7 @@ func (c *RpcClient) Subscribe(ctx context.Context, namespace string, channel any
 func (c *RpcClient) _subscribe(ctx context.Context, namespace string, channel any, args ...any) (*rpc.ClientSubscription, error) {
 	done, err := c.applyRateLimit(ctx, false)
 	if err != nil {
-		return nil, err
+		return nil, redactErrorURLs(err)
 	}
 	defer done()
 
@@ -193,7 +196,7 @@ func (c *RpcClient) _subscribe(ctx context.Context, namespace string, channel an
 		}
 	}
 
-	return sub, err
+	return sub, redactErrorURLs(err)
 }
 
 func (c *RpcClient) Notify(ctx context.Context, method string, args ...any) error {
@@ -203,7 +206,7 @@ func (c *RpcClient) Notify(ctx context.Context, method string, args ...any) erro
 
 	done, err := c.applyRateLimit(ctx, false)
 	if err != nil {
-		return err
+		return redactErrorURLs(err)
 	}
 	defer done()
 
@@ -218,7 +221,7 @@ func (c *RpcClient) Notify(ctx context.Context, method string, args ...any) erro
 		}
 	}
 
-	return err
+	return redactErrorURLs(err)
 }
 
 func (c *RpcClient) RegisterName(name string, receiver any) error {
@@ -226,7 +229,7 @@ func (c *RpcClient) RegisterName(name string, receiver any) error {
 		c.metrics.ClientFunctionsCalls.WithLabelValues(c.id, "RegisterName").Inc()
 	}
 
-	return c.c.RegisterName(name, receiver)
+	return redactErrorURLs(c.c.RegisterName(name, receiver))
 }
 
 func (c *RpcClient) SetHeader(key string, value string) {
@@ -244,7 +247,7 @@ func (c *RpcClient) SupportedModules() (map[string]string, error) {
 
 	done, err := c.applyRateLimit(context.Background(), false)
 	if err != nil {
-		return nil, err
+		return nil, redactErrorURLs(err)
 	}
 	defer done()
 
@@ -259,7 +262,7 @@ func (c *RpcClient) SupportedModules() (map[string]string, error) {
 		}
 	}
 
-	return modules, err
+	return modules, redactErrorURLs(err)
 }
 
 func (c *RpcClient) SupportsSubscriptions() bool {

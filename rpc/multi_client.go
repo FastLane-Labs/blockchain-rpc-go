@@ -225,7 +225,7 @@ func (c *MultiRpcClient) BatchCallContext(ctx context.Context, b []rpc.BatchElem
 	}
 
 	if c.parallelCalls {
-		return c.batchCallContextParallel(ctx, b, subscriptionRelated)
+		return redactErrorURLs(c.batchCallContextParallel(ctx, b, subscriptionRelated))
 	}
 
 	ic, err := c.getRpcClient(subscriptionRelated)
@@ -252,11 +252,11 @@ func (c *MultiRpcClient) Call(result any, method string, args ...any) error {
 
 func (c *MultiRpcClient) CallContext(ctx context.Context, result any, method string, args ...any) error {
 	if c.parallelCalls {
-		return c.callContextFirstSuccess(ctx, result, method, args...)
+		return redactErrorURLs(c.callContextFirstSuccess(ctx, result, method, args...))
 	}
 	// Special handling for eth_sendRawTransaction: send to all clients in parallel
 	if method == "eth_sendRawTransaction" {
-		return c.callContextParallel(ctx, result, method, args...)
+		return redactErrorURLs(c.callContextParallel(ctx, result, method, args...))
 	}
 
 	ic, err := c.getRpcClient(strings.HasSuffix(method, subscribeMethodSuffix))

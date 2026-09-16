@@ -2,7 +2,7 @@
 
 Existing callers do not need to change their code. `MultiRpcClientConfig`,
 `DialMulti`, and `DialMultiContext` retain their pre-feature layouts/signatures
-and default behavior in both `rpc` and `eth`. This includes positional config
+and default provider selection in both `rpc` and `eth`. This includes positional config
 literals and variables holding the original constructor function types.
 
 Opt in using the additional constructor:
@@ -51,6 +51,33 @@ by a provider. WebSocket JSON-RPC has no general remote cancellation mechanism.
 Existing provider metrics count individual copies, including cancellations as
 errors; they do not represent the number of failed application calls.
 
+## URL redaction in returned errors
+
+Returned RPC error text replaces detected URLs with `[REDACTED_URL]`, regardless
+of whether parallel calls are enabled. The complete URL is removed, including
+credentials in userinfo, paths, query parameters, or fragments. Detection covers
+absolute URLs such as HTTP(S)/WS(S), quoted URLs, and JSON-escaped slashes.
+Structured `url.Error` URL fields are also identified when malformed or relative.
+
+Redaction covers dial failures, calls, overall and per-element batch errors,
+notifications, supported-module requests, and subscription setup failures.
+Provider response bodies, error messages, and aggregated provider labels are
+inspected too. Error text without URLs is returned unchanged.
+
+Errors containing URLs are wrapped without mutating the original error.
+`errors.Is` and `errors.As` retain retry classification, HTTP status, RPC error
+codes, and revert data. Normal formatting and `%#v` use the redacted message.
+**Log the returned error, not an explicitly unwrapped cause:** the original
+error chain and structured data remain accessible for compatibility and can
+contain URLs. This is text redaction, not removal of arbitrary sensitive data.
+Errors later received from the underlying geth subscription's `Err` channel are
+outside the returned-error wrapper.
+
+Successful calls only perform an inlined nil check; they do not format errors,
+scan URLs, allocate wrappers, or acquire redaction locks. Batches also check
+each element's error, sharing the existing metrics loop. The success case of
+`BenchmarkErrorURLRedaction` reports 0 B/op and 0 allocs/op.
+
 ## Compatibility and implementation review
 
 The initial implementation added a field to `MultiRpcClientConfig`. That broke
@@ -70,12 +97,14 @@ The review also corrected:
 The single-provider path delegates directly. Multiple providers use a small
 stack-backed candidate slice, one buffered response channel, and one goroutine
 per provider. There is no new explicit mutex, wait group, closer goroutine, or
-wait for losing calls. Error formatting is deferred until total failure.
+wait for losing calls. Provider attribution and error aggregation are deferred
+until total failure; individual error messages are checked for URLs on failure.
 Channels, context cancellation, the existing transport, metrics, and rate
 limiters still perform synchronization; the client is not lock-free.
 
-The default success path gains only the opt-in branch. The queue-counter repair
-adds accounting on limiter/semaphore failure, with no added success-path work.
+The default success path gains the opt-in branch and nil checks for URL
+redaction. The queue-counter repair adds accounting on limiter/semaphore failure,
+with no added success-path work.
 
 ## Latency limits and measurements
 
@@ -89,7 +118,8 @@ Canceling queued copies helps, but cannot restore tokens already consumed.
 Measurements on 2026-09-16 used Go 1.22.2, darwin/arm64, `GOMAXPROCS=4`, and an
 in-memory HTTP transport returning a small JSON result. Prometheus metrics were
 enabled for the numbers below, as in the auctioneer. No live provider calls were
-made. These are synthetic overhead measurements, not production latency claims.
+made. These fan-out measurements used revision `1717c55`, before URL redaction;
+they are synthetic overhead measurements, not production latency claims.
 
 Sequential calls, zero transport delay, median of three 200 ms runs:
 
@@ -151,3 +181,6 @@ Tests cover early success with blocked losers, all-provider failures, ordinary
 and queued cancellation, continued transaction broadcasts, ownership of inputs
 and results after return, initialized decoders, malformed results, error types,
 batch element/transport failures, provider eligibility, and default opt-out.
+Redaction tests cover credentials in all URL components, multiple/escaped URLs,
+malformed endpoints, HTTP response bodies, subscription setup, decoder errors,
+both selection modes, unchanged errors, and preservation of error inspection.
