@@ -259,7 +259,7 @@ func TestParallelCallEligibleProviders(t *testing.T) {
 	}
 }
 
-func TestParallelBatchFirstResponsePerElement(t *testing.T) {
+func TestParallelBatchFirstResponse(t *testing.T) {
 	ctx := testContext(t)
 	started := make(chan struct{}, 3)
 	release := make(chan struct{})

@@ -226,6 +226,69 @@ func TestParallelNullIsAnAcceptedResult(t *testing.T) {
 	}
 }
 
+func TestParallelBatchAcceptsElementOutcomes(t *testing.T) {
+	started, canceled := make(chan struct{}), make(chan struct{})
+	c := testMultiClient(t,
+		func(context.Context, testRequest) (any, error) { return nil, nil },
+		func(ctx context.Context, req testRequest) (any, error) {
+			if req.Method == "test_null" {
+				close(started)
+				<-ctx.Done()
+				close(canceled)
+			}
+			return nil, ctx.Err()
+		},
+	)
+	setTestTransport(t, c, 0, transportFunc(func(req *http.Request) (*http.Response, error) {
+		var requests []testRequest
+		if err := json.NewDecoder(req.Body).Decode(&requests); err != nil {
+			return nil, err
+		}
+		select {
+		case <-started:
+		case <-req.Context().Done():
+			return nil, req.Context().Err()
+		}
+		responses := []testResponse{
+			{Version: "2.0", ID: requests[0].ID, Result: json.RawMessage("null")},
+			{Version: "2.0", ID: requests[1].ID}, // Missing result field.
+			// No response at all for requests[2].
+			{Version: "2.0", ID: requests[3].ID, Error: map[string]any{"code": -32002, "message": "request timed out", "data": "0x1234"}},
+			{Version: "2.0", ID: requests[4].ID, Result: "winner"},
+		}
+		body, err := json.Marshal(responses)
+		if err != nil {
+			return nil, err
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(string(body)))}, nil
+	}))
+	var null json.RawMessage
+	noResult, missing, reverted, success := "kept", "kept", "kept", ""
+	b := []gethrpc.BatchElem{
+		{Method: "test_null", Result: &null},
+		{Method: "test_no_result", Result: &noResult},
+		{Method: "test_missing", Result: &missing},
+		{Method: "test_reverted", Result: &reverted},
+		{Method: "test_success", Result: &success},
+	}
+	ctx := testContext(t)
+	if err := c.BatchCallContext(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+	if string(null) != "null" || b[0].Error != nil || b[1].Error != gethrpc.ErrNoResult || b[2].Error != gethrpc.ErrMissingBatchResponse {
+		t.Fatalf("batch element errors changed: %+v", b)
+	}
+	rpcErr, ok := b[3].Error.(gethrpc.Error)
+	dataErr, dataOK := b[3].Error.(gethrpc.DataError)
+	if !ok || !dataOK || rpcErr.ErrorCode() != -32002 || dataErr.ErrorData() != "0x1234" {
+		t.Fatalf("RPC error changed: %v", b[3].Error)
+	}
+	if noResult != "kept" || missing != "kept" || reverted != "kept" || success != "winner" || b[4].Error != nil {
+		t.Fatalf("incorrect results: %q %q %q %q", noResult, missing, reverted, success)
+	}
+	receive(t, ctx, canceled)
+}
+
 func TestParallelSkipsExhaustedRateLimit(t *testing.T) {
 	for _, batch := range []bool{false, true} {
 		t.Run(fmt.Sprintf("batch=%v", batch), func(t *testing.T) {

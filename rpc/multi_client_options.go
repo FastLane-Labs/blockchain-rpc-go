@@ -6,14 +6,13 @@ import "context"
 // MultiRpcClientConfig or the signatures of existing constructors.
 type MultiRpcClientOptions struct {
 	// ParallelCalls races calls and batches across all healthy, capable providers.
-	// It returns the first result or non-transport error per request. RPC error
-	// codes/messages do not affect selection. If all copies fail at the transport
-	// level, their errors are aggregated. Results are decoded only once.
-	// Provider weights and HTTP preference do not restrict the race. Subscriptions
-	// and notifications retain their existing behavior. The zero value is false.
-	// Pending copies are canceled on an accepted response except eth_sendRawTransaction calls
-	// and batches containing them, which continue to every eligible provider.
-	// Fan-out increases provider load; each provider's existing limits still apply.
+	// The first result or non-transport error wins, regardless of RPC error codes
+	// or messages. All-transport failures are aggregated. Results are decoded once.
+	// Ordinary losing copies are canceled; eth_sendRawTransaction and batches
+	// containing it continue under the caller's context.
+	// Weights and HTTP preference do not restrict the race. Provider limits still
+	// apply, and fan-out increases their load. Subscriptions and notifications
+	// retain their existing behavior. The zero value preserves default selection.
 	ParallelCalls bool
 }
 

@@ -65,11 +65,7 @@ func (c *MultiRpcClient) callContextFirstResponse(ctx context.Context, result an
 	}
 	if len(clients) == 1 {
 		// No extra copying, serialization, goroutine or channel is needed.
-		err := clients[0].rpcClient.CallContext(ctx, result, method, args...)
-		if isParallelTransportError(err) {
-			return fmt.Errorf("%s: %w", clients[0].rpcClient.id, err)
-		}
-		return err
+		return clients[0].rpcClient.CallContext(ctx, result, method, args...)
 	}
 	if result != nil {
 		v := reflect.ValueOf(result)
@@ -95,8 +91,6 @@ func (c *MultiRpcClient) callContextFirstResponse(ctx context.Context, result an
 			res := parallelResponse{client: client}
 			select {
 			case <-done:
-				res.err = ctx.Err()
-				responses <- res
 				return
 			default:
 			}
