@@ -2,91 +2,132 @@ package rpc
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"reflect"
 
 	"github.com/ethereum/go-ethereum/rpc"
 )
+
+type parallelBatchResponse struct {
+	client *internalRpcClient
+	batch  []rpc.BatchElem
+	raw    []json.RawMessage
+	err    error
+}
 
 func (c *MultiRpcClient) batchCallContextParallel(ctx context.Context, b []rpc.BatchElem, subscriptionRelated bool) error {
 	if len(b) == 0 {
 		return nil
 	}
-	providers := make([]*internalRpcClient, 0, len(c.allClients))
-	for _, client := range c.allClients {
-		if client.enabled.Load() && !client.rpcClient.sendOnly && (!subscriptionRelated || client.rpcClient.SupportsSubscriptions()) {
-			providers = append(providers, client)
-		}
-	}
-	if len(providers) == 0 {
+	var storage [8]*internalRpcClient
+	clients := c.parallelClients(storage[:0], subscriptionRelated, false)
+	if len(clients) == 0 {
 		return ErrNoAvailableClients
 	}
-	type response struct {
-		id    string
-		batch []rpc.BatchElem
-		err   error
-	}
-	responses := make(chan response, len(providers))
-	for _, p := range providers {
-		// Clone before starting the goroutine, so it never reads caller-owned
-		// batch elements after this method returns.
-		batch := make([]rpc.BatchElem, len(b))
-		for i, elem := range b {
-			batch[i] = rpc.BatchElem{Method: elem.Method, Args: elem.Args}
-			v := reflect.ValueOf(elem.Result)
-			if v.IsValid() && v.Kind() == reflect.Pointer && !v.IsNil() {
-				batch[i].Result = reflect.New(v.Type().Elem()).Interface()
+	if len(clients) == 1 {
+		client := clients[0].rpcClient
+		if err := client.BatchCallContext(ctx, b); err != nil {
+			return fmt.Errorf("%s: %w", client.id, err)
+		}
+		for i := range b {
+			if b[i].Error != nil {
+				b[i].Error = fmt.Errorf("%s: %w", client.id, b[i].Error)
 			}
 		}
-		go func() {
-			err := p.rpcClient.BatchCallContext(ctx, batch)
-			responses <- response{p.rpcClient.id, batch, err}
-		}()
+		return nil
+	}
+	// Snapshot metadata and encode inputs once. Workers never access b or any
+	// mutable arguments after ownership has returned to the caller.
+	template := make([]rpc.BatchElem, len(b))
+	broadcast := false
+	for i, elem := range b {
+		args, err := parallelArgs(elem.Args)
+		if err != nil {
+			return err
+		}
+		template[i] = rpc.BatchElem{Method: elem.Method, Args: args}
+		broadcast = broadcast || elem.Method == "eth_sendRawTransaction"
+	}
+	requestCtx := ctx
+	if !broadcast {
+		var cancel context.CancelFunc
+		requestCtx, cancel = context.WithCancel(ctx)
+		defer cancel()
+	}
+	responses := make(chan parallelBatchResponse, len(clients))
+	for _, client := range clients {
+		go func(ctx context.Context) {
+			res := parallelBatchResponse{client: client, batch: make([]rpc.BatchElem, len(template)), raw: make([]json.RawMessage, len(template))}
+			copy(res.batch, template)
+			for i := range res.batch {
+				res.batch[i].Result = &res.raw[i]
+			}
+			res.err = client.rpcClient.BatchCallContext(ctx, res.batch)
+			responses <- res
+		}(requestCtx)
 	}
 	completed := make([]bool, len(b))
-	errs := make([][]error, len(b))
-	var transportErrors []error
 	remaining := len(b)
-	for range providers {
+	responded := false
+	var failures []parallelBatchResponse
+	for range clients {
 		select {
 		case res := <-responses:
-			if res.err != nil {
-				transportErrors = append(transportErrors, fmt.Errorf("%s: %w", res.id, res.err))
-			}
-			for i, elem := range res.batch {
-				if completed[i] {
-					continue
+			if res.err == nil {
+				responded = true
+				for i := range res.batch {
+					if completed[i] || res.batch[i].Error != nil {
+						continue
+					}
+					res.batch[i].Error = json.Unmarshal(res.raw[i], b[i].Result)
+					if res.batch[i].Error == nil {
+						b[i].Error = nil
+						completed[i] = true
+						remaining--
+					}
 				}
-				err := res.err
-				if err == nil {
-					err = elem.Error
+				if remaining == 0 {
+					return nil
 				}
-				if err != nil {
-					errs[i] = append(errs[i], fmt.Errorf("%s: %w", res.id, err))
-					continue
-				}
-				reflect.ValueOf(b[i].Result).Elem().Set(reflect.ValueOf(elem.Result).Elem())
-				b[i].Error = nil
-				completed[i] = true
-				remaining--
 			}
-			if remaining == 0 {
-				return nil
-			}
-		case <-ctx.Done():
-			return errors.Join(append(transportErrors, ctx.Err())...)
+			failures = append(failures, res)
+		case <-requestCtx.Done():
+			setParallelBatchErrors(b, completed, failures, requestCtx.Err())
+			return requestCtx.Err()
 		}
 	}
-	for i := range b {
-		if !completed[i] {
-			b[i].Error = errors.Join(errs[i]...)
+	setParallelBatchErrors(b, completed, failures, nil)
+	// Match geth: per-request errors are in BatchElem.Error; an overall error
+	// indicates that no provider could return a batch response.
+	if !responded {
+		errs := make([]error, len(failures))
+		for i, res := range failures {
+			errs[i] = fmt.Errorf("%s: %w", res.client.rpcClient.id, res.err)
 		}
-	}
-	// Match geth: RPC errors belong to individual elements; transport errors
-	// are returned from the batch itself only if no provider could respond.
-	if len(transportErrors) == len(providers) {
-		return errors.Join(transportErrors...)
+		return errors.Join(errs...)
 	}
 	return nil
+}
+
+func setParallelBatchErrors(b []rpc.BatchElem, completed []bool, failures []parallelBatchResponse, cause error) {
+	for i := range b {
+		if completed[i] {
+			continue
+		}
+		errs := make([]error, 0, len(failures)+1)
+		for _, res := range failures {
+			err := res.err
+			if err == nil {
+				err = res.batch[i].Error
+			}
+			if err != nil {
+				errs = append(errs, fmt.Errorf("%s: %w", res.client.rpcClient.id, err))
+			}
+		}
+		if cause != nil {
+			errs = append(errs, cause)
+		}
+		b[i].Error = errors.Join(errs...)
+	}
 }

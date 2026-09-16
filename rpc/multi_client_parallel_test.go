@@ -62,7 +62,11 @@ func testServer(t *testing.T, handler testHandler) string {
 			responses[i] = testResponse{Version: "2.0", ID: req.ID, Result: value}
 			if err != nil {
 				responses[i].Result = nil
-				responses[i].Error = map[string]any{"code": -32000, "message": err.Error()}
+				rpcError := map[string]any{"code": -32000, "message": err.Error()}
+				if dataErr, ok := err.(gethrpc.DataError); ok {
+					rpcError["data"] = dataErr.ErrorData()
+				}
+				responses[i].Error = rpcError
 			}
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -114,8 +118,16 @@ func testMultiClient(t *testing.T, handlers ...testHandler) *MultiRpcClient {
 }
 
 func TestParallelCallFirstSuccess(t *testing.T) {
-	for _, method := range []string{"eth_call", "eth_sendRawTransaction"} {
-		t.Run(method, func(t *testing.T) {
+	for _, tc := range []struct {
+		name, method string
+		parallel     bool
+	}{
+		{"ordinary", "eth_call", true},
+		{"default_broadcast", "eth_sendRawTransaction", false},
+		{"parallel_broadcast", "eth_sendRawTransaction", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			method := tc.method
 			ctx := testContext(t)
 			started := make(chan struct{}, 3)
 			release := []chan struct{}{make(chan struct{}), make(chan struct{}), make(chan struct{})}
@@ -139,7 +151,12 @@ func TestParallelCallFirstSuccess(t *testing.T) {
 			}
 			c := testMultiClient(t, handlers...)
 			// Transaction broadcasting must remain enabled with the flag off.
-			c.parallelCalls = method != "eth_sendRawTransaction"
+			c.parallelCalls = tc.parallel
+			if tc.parallel && method == "eth_sendRawTransaction" {
+				// Send-only providers participate even without read health checks.
+				c.allClients[2].rpcClient.sendOnly = true
+				c.allClients[2].setEnabled(false)
+			}
 			defer func() {
 				for _, ch := range release {
 					select {
@@ -205,10 +222,8 @@ func TestParallelCallCancellation(t *testing.T) {
 	}
 	cancel()
 	err := receive(t, testContext(t), returned)
-	for _, id := range []string{"provider-0", "provider-1"} {
-		if err == nil || !strings.Contains(err.Error(), id+": ") || strings.Count(err.Error(), "context canceled") != 2 {
-			t.Fatalf("missing cancellation from %s in %v", id, err)
-		}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("missing context cancellation in %v", err)
 	}
 }
 
@@ -375,8 +390,15 @@ func TestParallelSupportedModules(t *testing.T) {
 }
 
 func TestParallelCallsOptIn(t *testing.T) {
-	for _, parallel := range []bool{false, true} {
-		t.Run(fmt.Sprintf("enabled=%v", parallel), func(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		options, parallel bool
+	}{
+		{"default", false, false},
+		{"zero_options", true, false},
+		{"parallel", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			var calls [2]atomic.Int32
 			var data []*RpcClientData
 			for i := range calls {
@@ -387,10 +409,13 @@ func TestParallelCallsOptIn(t *testing.T) {
 				data = append(data, &RpcClientData{Id: fmt.Sprintf("provider-%d", i), Url: url})
 			}
 			cfg := &MultiRpcClientConfig{RpcData: data, HealthCheckInterval: time.Hour}
-			if parallel {
-				cfg.ParallelCalls = true
+			var c *MultiRpcClient
+			var err error
+			if tc.options {
+				c, err = DialMultiContextWithOptions(testContext(t), cfg, MultiRpcClientOptions{ParallelCalls: tc.parallel})
+			} else {
+				c, err = DialMultiContext(testContext(t), cfg)
 			}
-			c, err := DialMultiContext(testContext(t), cfg)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -404,7 +429,7 @@ func TestParallelCallsOptIn(t *testing.T) {
 				t.Fatalf("unexpected batch errors: %v %v", err, b[0].Error)
 			}
 			wantSecond := int32(0)
-			if parallel {
+			if tc.parallel {
 				wantSecond = 2
 			}
 			if calls[0].Load() != 2 || calls[1].Load() != wantSecond {

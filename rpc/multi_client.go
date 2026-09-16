@@ -25,14 +25,7 @@ var (
 type MultiRpcClientConfig struct {
 	RpcData []*RpcClientData
 
-	// ParallelCalls sends calls and batches to all healthy, capable
-	// providers and returns the first success (per element for batches). If all
-	// providers fail, their errors are combined. Subscriptions still use one
-	// provider. The default, false, preserves priority-based selection.
-	ParallelCalls bool
-
-	// Prioritize HTTP RPCs for non-subscription related requests (recommended in high throughput environments).
-	// Ignored for calls and batches when ParallelCalls is enabled.
+	// Prioritize HTTP RPCs for non-subscription related requests (recommended in high throughput environments)
 	PreferHttpForNonSubscriptionRelated bool
 
 	// HealthCheckInterval is the interval at which the health check loop will run for all clients (defaults to 1 second)
@@ -147,7 +140,6 @@ func DialMultiContext(ctx context.Context, cfg *MultiRpcClientConfig) (*MultiRpc
 	}
 
 	c := &MultiRpcClient{
-		parallelCalls:                       cfg.ParallelCalls,
 		preferHttpForNonSubscriptionRelated: cfg.PreferHttpForNonSubscriptionRelated,
 		healthCheckInterval:                 cfg.HealthCheckInterval,
 		healthCheckTimeout:                  cfg.HealthCheckTimeout,
@@ -259,8 +251,11 @@ func (c *MultiRpcClient) Call(result any, method string, args ...any) error {
 }
 
 func (c *MultiRpcClient) CallContext(ctx context.Context, result any, method string, args ...any) error {
-	// Transaction submissions always broadcast, including in the default mode.
-	if c.parallelCalls || method == "eth_sendRawTransaction" {
+	if c.parallelCalls {
+		return c.callContextFirstSuccess(ctx, result, method, args...)
+	}
+	// Special handling for eth_sendRawTransaction: send to all clients in parallel
+	if method == "eth_sendRawTransaction" {
 		return c.callContextParallel(ctx, result, method, args...)
 	}
 
@@ -284,16 +279,11 @@ func (c *MultiRpcClient) CallContext(ctx context.Context, result any, method str
 
 // callContextParallel calls the method on all available clients in parallel
 // Returns the first successful response, or a combined error if all fail
+// This is specifically designed for eth_sendRawTransaction
 func (c *MultiRpcClient) callContextParallel(ctx context.Context, result any, method string, args ...any) error {
-	// Send-only clients participate only in transaction broadcasts.
+	// Get all available clients (send-only clients are always included)
 	availableClients := make([]*internalRpcClient, 0)
 	for _, client := range c.allClients {
-		if client.rpcClient.sendOnly && method != "eth_sendRawTransaction" {
-			continue
-		}
-		if strings.HasSuffix(method, subscribeMethodSuffix) && !client.rpcClient.SupportsSubscriptions() {
-			continue
-		}
 		if client.enabled.Load() || client.rpcClient.sendOnly {
 			availableClients = append(availableClients, client)
 		}

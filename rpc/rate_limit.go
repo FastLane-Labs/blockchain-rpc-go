@@ -41,10 +41,12 @@ func (c *RpcClient) applyRateLimit(ctx context.Context, nonBlocking bool) (done 
 	c.queued.Add(1)
 
 	if err := c.advanceLimiter(ctx, nonBlocking); err != nil {
+		c.queued.Add(^uint64(0))
 		return nil, err
 	}
 
 	if err := c.acquireSemaphore(ctx, defaultSemaphoreWeight, nonBlocking); err != nil {
+		c.queued.Add(^uint64(0))
 		return nil, err
 	}
 
