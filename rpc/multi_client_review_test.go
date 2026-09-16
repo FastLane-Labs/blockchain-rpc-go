@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 	"testing"
 	"time"
 
@@ -202,24 +201,43 @@ func TestParallelInitializedResults(t *testing.T) {
 	}
 }
 
-func TestParallelMalformedResultDoesNotWin(t *testing.T) {
+type countingResult struct {
+	calls *int
+	value string
+}
+
+func (r *countingResult) UnmarshalJSON(data []byte) error {
+	*r.calls = *r.calls + 1
+	return json.Unmarshal(data, &r.value)
+}
+
+func TestParallelDecodeErrorEndsRace(t *testing.T) {
 	for _, batch := range []bool{false, true} {
 		t.Run(fmt.Sprintf("batch=%v", batch), func(t *testing.T) {
+			started := make(chan struct{})
 			c := testMultiClient(t,
-				func(context.Context, testRequest) (any, error) { return 42, nil },
-				func(context.Context, testRequest) (any, error) { return "valid", nil },
+				func(context.Context, testRequest) (any, error) { <-started; return 42, nil },
+				func(ctx context.Context, _ testRequest) (any, error) {
+					close(started)
+					<-ctx.Done()
+					return "later response", nil
+				},
 			)
-			var result string
+			calls := 0
+			result := countingResult{calls: &calls}
+			var err error
 			if batch {
 				b := []gethrpc.BatchElem{{Method: "test_value", Result: &result}}
-				if err := c.BatchCall(b); err != nil || b[0].Error != nil {
-					t.Fatalf("unexpected errors: %v %v", err, b[0].Error)
+				if err = c.BatchCallContext(testContext(t), b); err != nil {
+					t.Fatal(err)
 				}
-			} else if err := c.Call(&result, "test_value"); err != nil {
-				t.Fatal(err)
+				err = b[0].Error
+			} else {
+				err = c.CallContext(testContext(t), &result, "test_value")
 			}
-			if result != "valid" {
-				t.Fatalf("invalid response won: %q", result)
+			var decodeErr *json.UnmarshalTypeError
+			if !errors.As(err, &decodeErr) || result.value != "" || calls != 1 {
+				t.Fatalf("expected one decode of the selected response, got %q, calls=%d, err=%v", result.value, calls, err)
 			}
 		})
 	}
@@ -242,14 +260,9 @@ func TestParallelErrorsPreserveTypes(t *testing.T) {
 		func(context.Context, testRequest) (any, error) { return nil, errors.New("upstream failed") },
 	)
 	err := c.Call(nil, "eth_call")
-	var rpcErr gethrpc.Error
-	if !errors.As(err, &rpcErr) || rpcErr.ErrorCode() != -32000 {
+	rpcErr, ok := err.(gethrpc.Error)
+	if !ok || rpcErr.ErrorCode() != -32000 {
 		t.Fatalf("RPC error type was lost: %v", err)
-	}
-	for _, id := range []string{"provider-0", "provider-1"} {
-		if !strings.Contains(err.Error(), id) {
-			t.Fatalf("missing provider %s: %v", id, err)
-		}
 	}
 }
 

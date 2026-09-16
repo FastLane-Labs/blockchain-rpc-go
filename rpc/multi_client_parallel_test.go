@@ -63,6 +63,9 @@ func testServer(t *testing.T, handler testHandler) string {
 			if err != nil {
 				responses[i].Result = nil
 				rpcError := map[string]any{"code": -32000, "message": err.Error()}
+				if coded, ok := err.(gethrpc.Error); ok {
+					rpcError["code"] = coded.ErrorCode()
+				}
 				if dataErr, ok := err.(gethrpc.DataError); ok {
 					rpcError["data"] = dataErr.ErrorData()
 				}
@@ -172,7 +175,10 @@ func TestParallelCallFirstSuccess(t *testing.T) {
 			for range release {
 				receive(t, ctx, started)
 			}
-			close(release[0])
+			if !tc.parallel {
+				// The legacy broadcast still ignores RPC errors until success.
+				close(release[0])
+			}
 			close(release[1])
 			if err := receive(t, ctx, returned); err != nil {
 				t.Fatal(err)
@@ -194,9 +200,14 @@ func TestParallelCallAllErrors(t *testing.T) {
 		func(context.Context, testRequest) (any, error) { return nil, errors.New("execution reverted") },
 		func(context.Context, testRequest) (any, error) { return nil, errors.New("upstream unavailable") },
 	)
+	for i := range c.allClients {
+		setTestTransport(t, c, i, transportFunc(func(*http.Request) (*http.Response, error) {
+			return nil, fmt.Errorf("provider-%d disconnected", i)
+		}))
+	}
 	result := "unchanged"
 	err := c.Call(&result, "eth_call")
-	for _, want := range []string{"provider-0: execution reverted", "provider-1: upstream unavailable"} {
+	for _, want := range []string{"provider-0 disconnected", "provider-1 disconnected"} {
 		if err == nil || !strings.Contains(err.Error(), want) {
 			t.Fatalf("missing %q in %v", want, err)
 		}
@@ -248,7 +259,7 @@ func TestParallelCallEligibleProviders(t *testing.T) {
 	}
 }
 
-func TestParallelBatchFirstSuccessPerElement(t *testing.T) {
+func TestParallelBatchFirstResponsePerElement(t *testing.T) {
 	ctx := testContext(t)
 	started := make(chan struct{}, 3)
 	release := make(chan struct{})
@@ -283,13 +294,13 @@ func TestParallelBatchFirstSuccessPerElement(t *testing.T) {
 	for range 3 {
 		receive(t, ctx, started)
 	}
-	for range 2 {
-		release <- struct{}{}
-	}
+	release <- struct{}{}
 	if err := receive(t, ctx, returned); err != nil {
 		t.Fatal(err)
 	}
-	if first != "first" || second != "second" || b[0].Error != nil || b[1].Error != nil {
+	// Either released provider can finish first, but its RPC error is final too.
+	if !((first == "first" && b[0].Error == nil && b[1].Error != nil) ||
+		(second == "second" && b[1].Error == nil && b[0].Error != nil)) {
 		t.Fatalf("unexpected batch results: %q %q, errors: %v %v", first, second, b[0].Error, b[1].Error)
 	}
 }
@@ -304,10 +315,8 @@ func TestParallelBatchAllErrors(t *testing.T) {
 	if err := c.BatchCall(b); err != nil {
 		t.Fatalf("RPC errors must be returned per element: %v", err)
 	}
-	for _, want := range []string{"provider-0: execution reverted", "provider-1: upstream unavailable"} {
-		if b[0].Error == nil || !strings.Contains(b[0].Error.Error(), want) {
-			t.Fatalf("missing %q in %v", want, b[0].Error)
-		}
+	if _, ok := b[0].Error.(gethrpc.Error); !ok {
+		t.Fatalf("expected the first RPC error unchanged, got %T: %v", b[0].Error, b[0].Error)
 	}
 	if result != "unchanged" {
 		t.Fatalf("failed batch modified result: %q", result)
@@ -339,6 +348,12 @@ func TestParallelBatchTransportErrors(t *testing.T) {
 			err := c.BatchCall(b)
 			if (err != nil) != allTransportErrors {
 				t.Fatalf("unexpected batch transport error: %v", err)
+			}
+			if !allTransportErrors {
+				if _, ok := b[0].Error.(gethrpc.Error); !ok || b[0].Error.Error() != "execution reverted" {
+					t.Fatalf("RPC error should finish the element unchanged: %v", b[0].Error)
+				}
+				return
 			}
 			for _, id := range []string{"provider-0", "provider-1"} {
 				if b[0].Error == nil || !strings.Contains(b[0].Error.Error(), id+": ") {
@@ -400,10 +415,23 @@ func TestParallelCallsOptIn(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var calls [2]atomic.Int32
+			var arrivals [2]atomic.Int32
+			ready := [2]chan struct{}{make(chan struct{}), make(chan struct{})}
 			var data []*RpcClientData
 			for i := range calls {
-				url := testServer(t, func(context.Context, testRequest) (any, error) {
-					calls[i].Add(1)
+				url := testServer(t, func(ctx context.Context, _ testRequest) (any, error) {
+					count := calls[i].Add(1)
+					if tc.parallel {
+						// Both copies must start before either can cancel the other.
+						if arrivals[count-1].Add(1) == 2 {
+							close(ready[count-1])
+						}
+						select {
+						case <-ready[count-1]:
+						case <-ctx.Done():
+							return nil, ctx.Err()
+						}
+					}
 					return nil, fmt.Errorf("provider-%d failed", i)
 				})
 				data = append(data, &RpcClientData{Id: fmt.Sprintf("provider-%d", i), Url: url})
@@ -420,12 +448,12 @@ func TestParallelCallsOptIn(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Cleanup(c.Close)
-			if err := c.Call(nil, "eth_call"); err == nil {
+			if err := c.CallContext(testContext(t), nil, "eth_call"); err == nil {
 				t.Fatal("expected call failure")
 			}
 			var result string
 			b := []gethrpc.BatchElem{{Method: "eth_call", Result: &result}}
-			if err := c.BatchCall(b); err != nil || b[0].Error == nil {
+			if err := c.BatchCallContext(testContext(t), b); err != nil || b[0].Error == nil {
 				t.Fatalf("unexpected batch errors: %v %v", err, b[0].Error)
 			}
 			wantSecond := int32(0)

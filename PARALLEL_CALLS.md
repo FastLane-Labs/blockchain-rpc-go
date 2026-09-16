@@ -19,38 +19,42 @@ Passing zero-valued options also preserves the default behavior.
 - Calls race all healthy providers capable of serving the request. Weights and
   HTTP preference do not exclude eligible providers from the race. The existing
   health checks and per-provider limits still apply.
-- The first successfully decoded response wins. No other provider has to finish
-  before the call returns. Ordinary losing copies are canceled, including copies
+- The first result or non-transport error wins. Every JSON-RPC error is accepted
+  unchanged, including reverts, regardless of its code or message. No other
+  provider has to finish. Ordinary losing copies are canceled, including copies
   queued behind rate/concurrency limits that may never reach their provider.
-- `eth_sendRawTransaction` copies continue after the first success, subject to
+- Typed network errors, HTTP status failures, EOF/closed connections, closed
+  clients, and provider context timeouts/cancellation allow other copies to
+  continue. A JSON-RPC error saying "request timed out" is still an accepted
+  answer. No RPC codes or error message text are used for classification.
+- `eth_sendRawTransaction` copies continue after the first accepted response, subject to
   the caller's context. These calls include send-only providers. Batches continue
   to use read-capable providers; batches containing a transaction broadcast are
-  also exempt from cancellation on success.
-- Batch elements can succeed on different providers. Return as soon as every
-  element has succeeded, or once all providers have responded. Element errors
-  remain in `BatchElem.Error`; an overall failure is returned if every provider
-  fails to return a batch response. A batch is not an atomic snapshot.
-- If every provider fails, return all provider errors with provider IDs.
-  `errors.Is` and `errors.As` retain access to underlying errors, including RPC
-  error codes and revert data. Caller cancellation returns promptly, with errors
-  observed so far; it does not wait to collect pending provider errors.
+  also exempt from cancellation on an accepted response.
+- Batch elements accept results or non-transport errors independently. Return
+  once every element has an outcome, or all providers have responded. Element
+  errors remain in `BatchElem.Error`; an overall non-transport failure ends the
+  batch immediately, and exhausted transport failures are aggregated. A batch
+  is not an atomic snapshot.
+- If every provider has a transport failure, return all failures with provider
+  IDs. `errors.Is` and `errors.As` retain access to their causes. Accepted RPC
+  errors are returned directly, preserving direct interface assertions, codes,
+  and revert data. Caller cancellation/deadline stops the whole race promptly,
+  with errors observed so far; it does not wait for pending provider errors.
 - Subscription and notification APIs keep their existing selection behavior.
 
-Success is determined at the RPC/JSON decoding layer. A valid JSON `null` can
-win; method-specific checks performed later by `eth` (for example, converting
+Selection happens before decoding the result into the caller's destination.
+A valid JSON `null` can win; method-specific checks performed later by `eth` (for example, converting
 a missing transaction into `ethereum.NotFound`) are outside this race.
 
 Workers never access the caller's result and snapshot mutable arguments before
-starting. With multiple providers, result decoding stays on the calling goroutine
-and uses independent candidate storage. A failed decode cannot contaminate the
-winner or the caller's initialized maps, slices, or pointers. Initialized values
-and private scalar decoder configuration are preserved; a success replaces the
-destination value, so existing aliases to its old reference values are not updated.
-Initialized private reference state and unsafe pointers cannot be safely isolated
-and return an error rather than executing an unsafe decoder. Custom decoders must
-not depend on external side effects: effects through globals, callbacks, and
-channels cannot be rolled back. The default and single-provider paths retain
-their existing decoding behavior.
+starting. Only the selected response is decoded, once, on the calling goroutine.
+Decoding errors are returned immediately; they do not select another provider.
+This retains the usual
+`encoding/json` semantics for initialized receivers, maps, and custom decoders.
+As with a normal RPC call, unsuccessful decoding can partially update a result.
+There is no rollback of custom decoder side effects, but a second provider can
+never decode into that same destination after a failed decode.
 
 Cancellation releases local resources; it cannot undo processing already done
 by a provider. WebSocket JSON-RPC has no general remote cancellation mechanism.
@@ -68,7 +72,7 @@ is retained for callers that do not opt in.
 The review also corrected:
 
 - Workers marshaling mutable caller arguments after the call returned.
-- Zero-initialized result copies losing initialized/custom decoder state.
+- Selecting responses before decoding, preserving initialized/custom decoder state.
 - Flattened error strings discarding RPC error types and revert data.
 - Canceled rate-limit/concurrency waits leaking the private queue counter.
 - Unnecessary goroutines, channels, and copying with only one eligible provider.
@@ -95,7 +99,9 @@ Canceling queued copies helps, but cannot restore tokens already consumed.
 Measurements on 2026-09-16 used Go 1.22.2, darwin/arm64, `GOMAXPROCS=4`, and an
 in-memory HTTP transport returning a small JSON result. Prometheus metrics were
 enabled for the numbers below, as in the auctioneer. No live provider calls were
-made. These are synthetic overhead measurements, not production latency claims.
+made. The measurements below are historical, from revision `1717c55`, before
+the change to accepting the first non-transport response. They are synthetic
+overhead measurements, not production latency claims for the current code.
 
 Sequential calls, zero transport delay, median of three 200 ms runs:
 
@@ -143,6 +149,24 @@ The revised implementation does not satisfy an absolute no-slowdown guarantee.
 The 1 ms cases are close at the median, but are not a substitute for measuring
 the auctioneer's actual load, payloads, quotas, and providers.
 
+After changing selection to the first non-transport response, the same concurrent
+benchmark was run with the auctioneer's Go 1.24.3 and geth 1.15.3 dependencies.
+Medians of three 500 ms runs follow, in microseconds. These used four callers,
+metrics enabled, and no concurrent builds/tests or live providers.
+
+| Provider delay | Providers | Default p50 / p95 / p99 | Parallel p50 / p95 / p99 |
+| --- | ---: | ---: | ---: |
+| 0 | 2 | 5.88 / 36.3 / 139 | 11.5 / 39.3 / 187 |
+| 0 | 4 | 5.96 / 35.1 / 127 | 12.2 / 63.2 / 229 |
+| 1 ms | 2 | 1157 / 1243 / 1726 | 1167 / 1291 / 2975 |
+| 1 ms | 4 | 1161 / 1274 / 1661 | 1160 / 1302 / 2424 |
+
+Workers now check cancellation before entering the underlying RPC client, so
+copies that have already lost can skip serialization and transport work. This
+particularly reduces work in the zero-delay benchmark. The 1 ms medians remain
+close; tail measurements are variable and higher for parallel calls in these
+runs. These results do not establish a production latency guarantee.
+
 ## Validation
 
 - Full package race tests: `go test -race ./... -timeout 60s`.
@@ -153,7 +177,7 @@ the auctioneer's actual load, payloads, quotas, and providers.
   temporary module replacement; its source and module files were unchanged.
 - The auctioneer's complete test suite passed against the revised library.
 
-Tests cover early success with blocked losers, all-provider failures, ordinary
+Tests cover early results and RPC errors with blocked losers, all-provider transport failures, ordinary
 and queued cancellation, continued transaction broadcasts, ownership of inputs
-and results after return, initialized decoders, malformed results, error types,
+and results after return, initialized decoders, single decoding, error types,
 batch element/transport failures, provider eligibility, and default opt-out.

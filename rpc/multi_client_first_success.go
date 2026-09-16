@@ -56,7 +56,7 @@ type parallelResponse struct {
 	err    error
 }
 
-func (c *MultiRpcClient) callContextFirstSuccess(ctx context.Context, result any, method string, args ...any) error {
+func (c *MultiRpcClient) callContextFirstResponse(ctx context.Context, result any, method string, args ...any) error {
 	var storage [8]*internalRpcClient
 	broadcast := method == "eth_sendRawTransaction"
 	clients := c.parallelClients(storage[:0], strings.HasSuffix(method, subscribeMethodSuffix), broadcast)
@@ -65,10 +65,11 @@ func (c *MultiRpcClient) callContextFirstSuccess(ctx context.Context, result any
 	}
 	if len(clients) == 1 {
 		// No extra copying, serialization, goroutine or channel is needed.
-		if err := clients[0].rpcClient.CallContext(ctx, result, method, args...); err != nil {
+		err := clients[0].rpcClient.CallContext(ctx, result, method, args...)
+		if isParallelTransportError(err) {
 			return fmt.Errorf("%s: %w", clients[0].rpcClient.id, err)
 		}
-		return nil
+		return err
 	}
 	if result != nil {
 		v := reflect.ValueOf(result)
@@ -87,10 +88,18 @@ func (c *MultiRpcClient) callContextFirstSuccess(ctx context.Context, result any
 		defer cancel()
 	}
 	responses := make(chan parallelResponse, len(clients))
+	done := requestCtx.Done()
 	needsResult := result != nil
 	for _, client := range clients {
 		go func(client *internalRpcClient, ctx context.Context) {
 			res := parallelResponse{client: client}
+			select {
+			case <-done:
+				res.err = ctx.Err()
+				responses <- res
+				return
+			default:
+			}
 			if needsResult {
 				var raw json.RawMessage
 				res.err = client.rpcClient.CallContext(ctx, &raw, method, encodedArgs...)
@@ -105,22 +114,29 @@ func (c *MultiRpcClient) callContextFirstSuccess(ctx context.Context, result any
 	for range clients {
 		select {
 		case res := <-responses:
-			if res.err == nil && needsResult {
-				res.err = decodeParallelResult(res.raw, result)
+			select {
+			case <-done:
+				return parallelErrors(method, failures, requestCtx.Err())
+			default:
 			}
-			if res.err == nil {
-				return nil
+			if !isParallelTransportError(res.err) {
+				if res.err != nil || !needsResult {
+					return res.err
+				}
+				// Choose the response before decoding, so only one provider can
+				// ever write to the caller's receiver, even when decoding fails.
+				return json.Unmarshal(res.raw, result)
 			}
 			failures = append(failures, res)
-		case <-requestCtx.Done():
+		case <-done:
 			return parallelErrors(method, failures, requestCtx.Err())
 		}
 	}
 	return parallelErrors(method, failures, nil)
 }
 
-// Formatting and wrapping are deferred until failure, so an early provider
-// error does not add formatting work to a later successful response.
+// Format only exhausted transport failures. Accepted RPC errors are returned
+// unchanged, preserving their public interfaces and error data.
 func parallelErrors(method string, failures []parallelResponse, cause error) error {
 	errs := make([]error, 0, len(failures)+1)
 	for _, res := range failures {
