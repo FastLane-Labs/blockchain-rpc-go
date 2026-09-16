@@ -18,7 +18,7 @@ Zero-valued options preserve the default behavior.
 - Return the first result or non-transport error. All JSON-RPC errors, including
   reverts, are accepted unchanged; RPC codes and messages never affect selection.
   Direct `rpc.Error` / `rpc.DataError` assertions and revert data are preserved.
-- Wait for another copy after a timeout, network/HTTP/WebSocket failure, closed
+- Wait for another copy after a timeout, network/HTTP/WebSocket/TLS failure, closed
   connection/client, or rejected local rate-limit wait. Geth's two private,
   untyped connection errors require exact local-message checks, performed only
   after excluding RPC errors. An RPC error saying "request timed out" still wins.

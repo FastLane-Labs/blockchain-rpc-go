@@ -2,6 +2,8 @@ package rpc
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -48,6 +50,8 @@ func TestParallelTransportErrorClassification(t *testing.T) {
 		{"websocket close", &websocket.CloseError{Code: websocket.CloseAbnormalClosure}, true},
 		{"websocket write after close", websocket.ErrCloseSent, true},
 		{"websocket handshake", websocket.ErrBadHandshake, true},
+		{"TLS certificate failure", &tls.CertificateVerificationError{Err: x509.UnknownAuthorityError{}}, true},
+		{"TLS protocol failure", tls.RecordHeaderError{Msg: "first record does not look like a TLS handshake"}, true},
 		{"geth reconnection", errors.New("client reconnected"), true},
 		{"geth dead connection", errors.New("connection lost"), true},
 		{"ordinary error", errors.New("application error"), false},

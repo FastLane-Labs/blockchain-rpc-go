@@ -2,6 +2,7 @@ package rpc
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"io"
 	"net"
@@ -39,5 +40,8 @@ func isParallelTransportError(err error) bool {
 	var networkErr net.Error
 	var httpErr rpc.HTTPError
 	var closeErr *websocket.CloseError
-	return errors.As(err, &waitErr) || errors.As(err, &networkErr) || errors.As(err, &httpErr) || errors.As(err, &closeErr)
+	var certificateErr *tls.CertificateVerificationError
+	var tlsErr tls.RecordHeaderError
+	return errors.As(err, &waitErr) || errors.As(err, &networkErr) || errors.As(err, &httpErr) ||
+		errors.As(err, &closeErr) || errors.As(err, &certificateErr) || errors.As(err, &tlsErr)
 }
