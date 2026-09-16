@@ -23,11 +23,21 @@ func isParallelTransportError(err error) bool {
 	}
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) ||
 		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.ErrClosedPipe) ||
-		errors.Is(err, net.ErrClosed) || errors.Is(err, rpc.ErrClientQuit) || errors.Is(err, websocket.ErrCloseSent) {
+		errors.Is(err, net.ErrClosed) || errors.Is(err, rpc.ErrClientQuit) ||
+		errors.Is(err, websocket.ErrCloseSent) || errors.Is(err, websocket.ErrBadHandshake) {
 		return true
 	}
+	// Geth's two internal connection sentinels are unexported and untyped.
+	// RPC errors were excluded above, so node error messages never reach this.
+	for cause := err; cause != nil; cause = errors.Unwrap(cause) {
+		switch cause.Error() {
+		case "client reconnected", "connection lost":
+			return true
+		}
+	}
+	var waitErr rateLimitWaitError
 	var networkErr net.Error
 	var httpErr rpc.HTTPError
 	var closeErr *websocket.CloseError
-	return errors.As(err, &networkErr) || errors.As(err, &httpErr) || errors.As(err, &closeErr)
+	return errors.As(err, &waitErr) || errors.As(err, &networkErr) || errors.As(err, &httpErr) || errors.As(err, &closeErr)
 }

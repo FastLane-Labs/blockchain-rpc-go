@@ -8,12 +8,16 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	gethrpc "github.com/ethereum/go-ethereum/rpc"
 	"github.com/gorilla/websocket"
+	"golang.org/x/time/rate"
 )
 
 type rpcOutcomeError struct {
@@ -43,12 +47,17 @@ func TestParallelTransportErrorClassification(t *testing.T) {
 		{"HTTP failure", gethrpc.HTTPError{StatusCode: 503, Status: "unavailable"}, true},
 		{"websocket close", &websocket.CloseError{Code: websocket.CloseAbnormalClosure}, true},
 		{"websocket write after close", websocket.ErrCloseSent, true},
+		{"websocket handshake", websocket.ErrBadHandshake, true},
+		{"geth reconnection", errors.New("client reconnected"), true},
+		{"geth dead connection", errors.New("connection lost"), true},
 		{"ordinary error", errors.New("application error"), false},
 		{"timeout text only", errors.New("context deadline exceeded"), false},
 		{"RPC revert", rpcOutcomeError{3, "execution reverted"}, false},
 		{"RPC timeout", rpcOutcomeError{-32002, "request timed out"}, false},
 		{"RPC internal error", rpcOutcomeError{-32603, "internal error"}, false},
 		{"unknown RPC code", rpcOutcomeError{123456, "context deadline exceeded"}, false},
+		{"RPC connection message", rpcOutcomeError{-32000, "connection lost"}, false},
+		{"RPC reconnection message", rpcOutcomeError{-32000, "client reconnected"}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := isParallelTransportError(tc.err); got != tc.transport {
@@ -214,5 +223,79 @@ func TestParallelNullIsAnAcceptedResult(t *testing.T) {
 	var result json.RawMessage
 	if err := c.CallContext(testContext(t), &result, "eth_getTransactionReceipt"); err != nil || strings.TrimSpace(string(result)) != "null" {
 		t.Fatalf("null should finish the race: %s %v", result, err)
+	}
+}
+
+func TestParallelSkipsExhaustedRateLimit(t *testing.T) {
+	for _, batch := range []bool{false, true} {
+		t.Run(fmt.Sprintf("batch=%v", batch), func(t *testing.T) {
+			c := testMultiClient(t,
+				func(context.Context, testRequest) (any, error) {
+					t.Error("rate-limited request reached the provider")
+					return "unexpected", nil
+				},
+				func(context.Context, testRequest) (any, error) {
+					time.Sleep(10 * time.Millisecond)
+					return "winner", nil
+				},
+			)
+			lim := rate.NewLimiter(1, 1)
+			lim.Allow()
+			c.allClients[0].rpcClient.lim = lim
+			ctx, cancel := context.WithTimeout(testContext(t), 500*time.Millisecond)
+			defer cancel()
+			var result string
+			var err error
+			if batch {
+				b := []gethrpc.BatchElem{{Method: "eth_call", Result: &result}}
+				if err = c.BatchCallContext(ctx, b); err == nil {
+					err = b[0].Error
+				}
+			} else {
+				err = c.CallContext(ctx, &result, "eth_call")
+			}
+			if err != nil || result != "winner" {
+				t.Fatalf("local limiter failure won: %q, %v", result, err)
+			}
+		})
+	}
+}
+
+func TestParallelWebSocketReconnectFailure(t *testing.T) {
+	var first atomic.Bool
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if first.Swap(true) {
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer conn.Close()
+		// Disconnect on the first request; subsequent handshakes are rejected.
+		_, _, _ = conn.ReadMessage()
+	}))
+	defer server.Close()
+	ws, err := gethrpc.DialContext(testContext(t), "ws"+strings.TrimPrefix(server.URL, "http"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := testMultiClient(t,
+		func(context.Context, testRequest) (any, error) { return nil, nil },
+		func(context.Context, testRequest) (any, error) {
+			time.Sleep(10 * time.Millisecond)
+			return "winner", nil
+		},
+	)
+	c.allClients[0].rpcClient.c.Close()
+	c.allClients[0].rpcClient.c = ws
+	for range 2 {
+		var result string
+		if err := c.CallContext(testContext(t), &result, "eth_call"); err != nil || result != "winner" {
+			t.Fatalf("websocket connection failure won: %q, %v", result, err)
+		}
 	}
 }

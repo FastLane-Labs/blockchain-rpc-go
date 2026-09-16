@@ -15,6 +15,12 @@ var (
 	ErrMaxConcurrencyExceeded = errors.New("max concurrency exceeded")
 )
 
+// The limiter can reject a wait before the context expires. Its untyped error
+// must remain distinguishable from an RPC response when racing providers.
+type rateLimitWaitError struct{ error }
+
+func (e rateLimitWaitError) Unwrap() error { return e.error }
+
 // Returns whether current rate limits allow a request to be made now.
 func (c *RpcClient) canMakeRequestNow() bool {
 	if c.lim != nil && c.lim.Tokens() < 1 {
@@ -70,6 +76,9 @@ func (c *RpcClient) advanceLimiter(ctx context.Context, nonBlocking bool) error 
 	}
 
 	if err := c.lim.Wait(ctx); err != nil {
+		if ctx.Err() == nil {
+			return rateLimitWaitError{err}
+		}
 		return err
 	}
 

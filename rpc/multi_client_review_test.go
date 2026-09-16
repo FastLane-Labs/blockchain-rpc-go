@@ -157,6 +157,28 @@ func TestRateLimitCancellationDoesNotLeakQueueCount(t *testing.T) {
 	}
 }
 
+func TestRateLimitWaitPreservesDefaultErrors(t *testing.T) {
+	c := &RpcClient{lim: rate.NewLimiter(1, 1)}
+	c.lim.Allow()
+	ctx, cancel := context.WithTimeout(testContext(t), 500*time.Millisecond)
+	err := c.advanceLimiter(ctx, false)
+	cancel()
+	// Existing default retry policy and error text are unchanged.
+	if err == nil || err.Error() != "rate: Wait(n=1) would exceed context deadline" || !isErrorRetryable(err) {
+		t.Fatalf("limiter error changed: %v", err)
+	}
+	ctx, cancel = context.WithCancel(testContext(t))
+	cancel()
+	if err := c.advanceLimiter(ctx, false); err != context.Canceled {
+		t.Fatalf("context error identity changed: %v", err)
+	}
+	ctx, cancel = context.WithDeadline(testContext(t), time.Now().Add(-time.Second))
+	defer cancel()
+	if err := c.advanceLimiter(ctx, false); err != context.DeadlineExceeded {
+		t.Fatalf("deadline error identity changed: %v", err)
+	}
+}
+
 type initializedResult struct {
 	prefix string
 	value  string
