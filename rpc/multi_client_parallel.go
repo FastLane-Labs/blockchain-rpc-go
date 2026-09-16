@@ -32,7 +32,7 @@ func (c *MultiRpcClient) batchCallContextParallel(ctx context.Context, b []rpc.B
 		}
 		for i := range b {
 			if b[i].Error != nil {
-				b[i].Error = redactErrorURLs(fmt.Errorf("%s: %w", client.id, b[i].Error))
+				b[i].Error = fmt.Errorf("%s: %w", client.id, b[i].Error)
 			}
 		}
 		return nil
@@ -128,6 +128,6 @@ func setParallelBatchErrors(b []rpc.BatchElem, completed []bool, failures []para
 		if cause != nil {
 			errs = append(errs, cause)
 		}
-		b[i].Error = redactErrorURLs(errors.Join(errs...))
+		b[i].Error = errors.Join(errs...)
 	}
 }
