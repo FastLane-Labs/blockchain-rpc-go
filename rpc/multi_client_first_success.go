@@ -106,10 +106,7 @@ func (c *MultiRpcClient) callContextFirstSuccess(ctx context.Context, result any
 		select {
 		case res := <-responses:
 			if res.err == nil && needsResult {
-				// Only the receiving goroutine touches result. Decode into the
-				// original receiver to preserve initialized maps/structs and
-				// custom UnmarshalJSON state, just as a normal RPC call does.
-				res.err = json.Unmarshal(res.raw, result)
+				res.err = decodeParallelResult(res.raw, result)
 			}
 			if res.err == nil {
 				return nil

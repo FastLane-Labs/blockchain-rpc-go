@@ -41,10 +41,16 @@ win; method-specific checks performed later by `eth` (for example, converting
 a missing transaction into `ethereum.NotFound`) are outside this race.
 
 Workers never access the caller's result and snapshot mutable arguments before
-starting. Result decoding stays on the calling goroutine and retains the usual
-`encoding/json` semantics for initialized receivers, maps, and custom decoders.
-As with a normal RPC call, unsuccessful decoding can partially update a result.
-There is no rollback of custom decoder side effects.
+starting. With multiple providers, result decoding stays on the calling goroutine
+and uses independent candidate storage. A failed decode cannot contaminate the
+winner or the caller's initialized maps, slices, or pointers. Initialized values
+and private scalar decoder configuration are preserved; a success replaces the
+destination value, so existing aliases to its old reference values are not updated.
+Initialized private reference state and unsafe pointers cannot be safely isolated
+and return an error rather than executing an unsafe decoder. Custom decoders must
+not depend on external side effects: effects through globals, callbacks, and
+channels cannot be rolled back. The default and single-provider paths retain
+their existing decoding behavior.
 
 Cancellation releases local resources; it cannot undo processing already done
 by a provider. WebSocket JSON-RPC has no general remote cancellation mechanism.

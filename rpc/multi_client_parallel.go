@@ -80,7 +80,7 @@ func (c *MultiRpcClient) batchCallContextParallel(ctx context.Context, b []rpc.B
 					if completed[i] || res.batch[i].Error != nil {
 						continue
 					}
-					res.batch[i].Error = json.Unmarshal(res.raw[i], b[i].Result)
+					res.batch[i].Error = decodeParallelResult(res.raw[i], b[i].Result)
 					if res.batch[i].Error == nil {
 						b[i].Error = nil
 						completed[i] = true
