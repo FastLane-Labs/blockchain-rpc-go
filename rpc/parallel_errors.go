@@ -3,6 +3,7 @@ package rpc
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -24,8 +25,16 @@ func isParallelTransportError(err error) bool {
 	}
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) ||
 		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.ErrClosedPipe) ||
-		errors.Is(err, net.ErrClosed) || errors.Is(err, rpc.ErrClientQuit) ||
+		errors.Is(err, net.ErrClosed) || errors.Is(err, rpc.ErrClientQuit) || errors.Is(err, rpc.ErrNoResult) ||
 		errors.Is(err, websocket.ErrCloseSent) || errors.Is(err, websocket.ErrBadHandshake) {
+		return true
+	}
+	// Workers decode into raw JSON, so decoder errors mean the provider answered
+	// with malformed or misshapen JSON-RPC, not that the caller's receiver is
+	// incompatible. Such providers must not win over a healthy one.
+	var syntaxErr *json.SyntaxError
+	var typeErr *json.UnmarshalTypeError
+	if errors.As(err, &syntaxErr) || errors.As(err, &typeErr) {
 		return true
 	}
 	// Geth's two internal connection sentinels are unexported and untyped.

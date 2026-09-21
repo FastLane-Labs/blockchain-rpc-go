@@ -7,7 +7,8 @@ import "context"
 type MultiRpcClientOptions struct {
 	// ParallelCalls races calls and batches across all healthy, capable providers.
 	// The first result or non-transport error wins, regardless of RPC error codes
-	// or messages. All-transport failures are aggregated. Results are decoded once.
+	// or messages. Malformed or misshapen provider responses count as transport
+	// failures. All-transport failures are aggregated. Results are decoded once.
 	// Ordinary losing copies are canceled; eth_sendRawTransaction and batches
 	// containing it continue under the caller's context. Like the default
 	// broadcast, eth_sendRawTransaction calls return the first success and only

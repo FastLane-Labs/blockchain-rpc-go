@@ -22,6 +22,10 @@ Zero-valued options preserve the default behavior.
   connection/client, or rejected local rate-limit wait. Geth's two private,
   untyped connection errors require exact local-message checks, performed only
   after excluding RPC errors. An RPC error saying "request timed out" still wins.
+- Wait for another copy when a provider answers 2xx with malformed, truncated, or
+  misshapen JSON-RPC, or omits the result field. Workers decode into raw JSON,
+  so these decoder errors always describe the provider's response, never the
+  caller's receiver. The default path treats them as retryable too.
 - Batches select the first response without an overall transport failure, then
   decode its elements once. Element errors stay in `BatchElem.Error`. Geth reports
   transport failures for the whole batch, not for individual elements.

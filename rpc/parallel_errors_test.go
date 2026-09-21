@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -53,6 +54,9 @@ func TestParallelTransportErrorClassification(t *testing.T) {
 		{"websocket handshake", websocket.ErrBadHandshake, true},
 		{"TLS certificate failure", &tls.CertificateVerificationError{Err: x509.UnknownAuthorityError{}}, true},
 		{"TLS protocol failure", tls.RecordHeaderError{Msg: "first record does not look like a TLS handshake"}, true},
+		{"malformed JSON", &json.SyntaxError{Offset: 12}, true},
+		{"misshapen JSON-RPC", &json.UnmarshalTypeError{Value: "array", Type: reflect.TypeOf("")}, true},
+		{"missing result field", gethrpc.ErrNoResult, true},
 		{"geth reconnection", errors.New("client reconnected"), true},
 		{"geth dead connection", errors.New("connection lost"), true},
 		{"ordinary error", errors.New("application error"), false},
@@ -256,6 +260,52 @@ func TestParallelBroadcastBatchContinuesAfterRPCError(t *testing.T) {
 	}
 	if err := receive(t, ctx, finished); err != nil {
 		t.Fatalf("losing broadcast was canceled: %v", err)
+	}
+}
+
+// A 2xx response with malformed or misshapen JSON-RPC is a provider failure,
+// like any other non-RPC error on the default path, not an answer.
+func TestParallelMalformedResponseIsProviderFailure(t *testing.T) {
+	for _, batch := range []bool{false, true} {
+		bodies := map[string]string{
+			"malformed":      `{"jsonrpc": definitely}`,
+			"truncated":      `{"jsonrpc":"2.0","id":1,"result":"0x`,
+			"missing result": `{"jsonrpc":"2.0","id":1}`,
+			"wrong shape":    `[]`,
+		}
+		if batch {
+			delete(bodies, "missing result")
+			bodies["wrong shape"] = `{"jsonrpc":"2.0","id":1,"result":"0x1"}`
+		}
+		for name, body := range bodies {
+			t.Run(fmt.Sprintf("batch=%v/%s", batch, name), func(t *testing.T) {
+				corrupted := make(chan struct{})
+				c := testMultiClient(t,
+					func(context.Context, testRequest) (any, error) { return nil, nil },
+					func(context.Context, testRequest) (any, error) { <-corrupted; return "winner", nil },
+				)
+				setTestTransport(t, c, 0, transportFunc(func(*http.Request) (*http.Response, error) {
+					close(corrupted)
+					return &http.Response{
+						StatusCode: http.StatusOK, Status: "200 OK",
+						Header: http.Header{"Content-Type": []string{"application/json"}},
+						Body:   io.NopCloser(strings.NewReader(body)),
+					}, nil
+				}))
+				var result string
+				if batch {
+					b := []gethrpc.BatchElem{{Method: "eth_call", Result: &result}}
+					if err := c.BatchCallContext(testContext(t), b); err != nil || b[0].Error != nil {
+						t.Fatalf("corrupt provider ended the batch: %v %v", err, b[0].Error)
+					}
+				} else if err := c.CallContext(testContext(t), &result, "eth_call"); err != nil {
+					t.Fatalf("corrupt provider ended the call: %v", err)
+				}
+				if result != "winner" {
+					t.Fatalf("got %q", result)
+				}
+			})
+		}
 	}
 }
 
