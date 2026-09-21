@@ -198,20 +198,21 @@ func TestParallelCallFirstSuccess(t *testing.T) {
 	}
 }
 
-func TestParallelCallAllErrors(t *testing.T) {
+func TestParallelCallAllTimeouts(t *testing.T) {
 	c := testMultiClient(t,
 		func(context.Context, testRequest) (any, error) { return nil, errors.New("execution reverted") },
 		func(context.Context, testRequest) (any, error) { return nil, errors.New("upstream unavailable") },
 	)
 	for i := range c.allClients {
-		setTestTransport(t, c, i, transportFunc(func(*http.Request) (*http.Response, error) {
-			return nil, fmt.Errorf("provider-%d disconnected", i)
-		}))
+		setTestTransport(t, c, i, failingTransport{})
 	}
 	result := "unchanged"
 	err := c.Call(&result, "eth_call")
-	for _, want := range []string{"provider-0 disconnected", "provider-1 disconnected"} {
-		if err == nil || !strings.Contains(err.Error(), want) {
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("aggregated error lost its cause: %v", err)
+	}
+	for _, want := range []string{"provider-0: ", "provider-1: "} {
+		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("missing %q in %v", want, err)
 		}
 	}
@@ -326,33 +327,26 @@ func TestParallelBatchAllErrors(t *testing.T) {
 	}
 }
 
-func TestParallelBatchTransportErrors(t *testing.T) {
-	for _, allTransportErrors := range []bool{false, true} {
-		t.Run(fmt.Sprintf("allTransportErrors=%v", allTransportErrors), func(t *testing.T) {
+func TestParallelBatchTimeouts(t *testing.T) {
+	for _, allTimeouts := range []bool{false, true} {
+		t.Run(fmt.Sprintf("allTimeouts=%v", allTimeouts), func(t *testing.T) {
 			c := testMultiClient(t,
 				func(context.Context, testRequest) (any, error) { return nil, errors.New("execution reverted") },
 				func(context.Context, testRequest) (any, error) { return nil, errors.New("execution reverted") },
 			)
-			// Exercise both mixed RPC/transport errors and all-transport failures.
-			for i, p := range c.allClients {
-				if allTransportErrors || i == 0 {
-					client, err := gethrpc.DialOptions(testContext(t), "http://unavailable", gethrpc.WithHTTPClient(&http.Client{
-						Transport: failingTransport{},
-					}))
-					if err != nil {
-						t.Fatal(err)
-					}
-					p.rpcClient.c.Close()
-					p.rpcClient.c = client
+			// Exercise both a mixed timeout/RPC error race and all-timeout failures.
+			for i := range c.allClients {
+				if allTimeouts || i == 0 {
+					setTestTransport(t, c, i, failingTransport{})
 				}
 			}
 			var result string
 			b := []gethrpc.BatchElem{{Method: "eth_call", Result: &result}}
 			err := c.BatchCall(b)
-			if (err != nil) != allTransportErrors {
-				t.Fatalf("unexpected batch transport error: %v", err)
+			if (err != nil) != allTimeouts {
+				t.Fatalf("unexpected batch timeout error: %v", err)
 			}
-			if !allTransportErrors {
+			if !allTimeouts {
 				if _, ok := b[0].Error.(gethrpc.Error); !ok || b[0].Error.Error() != "execution reverted" {
 					t.Fatalf("RPC error should finish the element unchanged: %v", b[0].Error)
 				}
@@ -362,18 +356,19 @@ func TestParallelBatchTransportErrors(t *testing.T) {
 				if b[0].Error == nil || !strings.Contains(b[0].Error.Error(), id+": ") {
 					t.Fatalf("missing %s in %v", id, b[0].Error)
 				}
-				if allTransportErrors && !strings.Contains(err.Error(), id+": ") {
-					t.Fatalf("missing %s in transport error %v", id, err)
+				if !strings.Contains(err.Error(), id+": ") {
+					t.Fatalf("missing %s in timeout error %v", id, err)
 				}
 			}
 		})
 	}
 }
 
+// A provider copy that times out on its own, before the caller's deadline.
 type failingTransport struct{}
 
 func (failingTransport) RoundTrip(*http.Request) (*http.Response, error) {
-	return nil, errors.New("connection refused")
+	return nil, context.DeadlineExceeded
 }
 
 func TestParallelSupportedModules(t *testing.T) {

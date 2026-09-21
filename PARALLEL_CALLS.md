@@ -15,20 +15,17 @@ Zero-valued options preserve the default behavior.
 
 - Race all healthy, capable providers, regardless of weights or HTTP preference.
   Existing health checks and per-provider rate/concurrency limits still apply.
-- Return the first result or non-transport error. All JSON-RPC errors, including
-  reverts, are accepted unchanged; RPC codes and messages never affect selection.
-  Direct `rpc.Error` / `rpc.DataError` assertions and revert data are preserved.
-- Wait for another copy after a timeout, network/HTTP/WebSocket/TLS failure, closed
-  connection/client, or rejected local rate-limit wait. Geth's two private,
-  untyped connection errors require exact local-message checks, performed only
-  after excluding RPC errors. An RPC error saying "request timed out" still wins.
-- Wait for another copy when a provider answers 2xx with malformed, truncated, or
-  misshapen JSON-RPC, or omits the result field. Workers decode into raw JSON,
-  so these decoder errors always describe the provider's response, never the
-  caller's receiver. The default path treats them as retryable too.
-- Batches select the first response without an overall transport failure, then
-  decode its elements once. Element errors stay in `BatchElem.Error`. Geth reports
-  transport failures for the whole batch, not for individual elements.
+- Return whichever provider answers first, whether a result or an error. Every
+  JSON-RPC error, including reverts, is accepted unchanged; RPC codes and
+  messages never affect selection. Direct `rpc.Error` / `rpc.DataError`
+  assertions and revert data are preserved. Transport failures such as a closed
+  connection, an HTTP status error, or a malformed response are answers too.
+- Discard only timeouts. A copy that failed with Go's `context.DeadlineExceeded`
+  ("context deadline exceeded"), or whose local rate-limit wait would exceed the
+  deadline, waits for another copy. An RPC error saying "request timed out" is
+  still an answer.
+- Batches select the first response without an overall timeout, then decode its
+  elements once. Element errors stay in `BatchElem.Error`.
 - Cancel ordinary losing copies, including queued copies that may never reach
   their provider. `eth_sendRawTransaction` copies and batches containing one
   continue under the caller's context. Single transaction calls include send-only
@@ -37,8 +34,8 @@ Zero-valued options preserve the default behavior.
   the first success, and only fail once every provider has failed, aggregating
   their errors with provider IDs. A fast `already known` or `nonce too low`
   rejection never hides a later acceptance. Batches containing a transaction
-  still select the first response without an overall transport failure.
-- Aggregate all transport failures with provider IDs when no provider answers.
+  still select the first response without an overall timeout.
+- Aggregate all timeouts with provider IDs when no provider answers.
   `errors.Is` / `errors.As` preserve their causes. Caller cancellation/deadline
   stops waiting promptly, with errors collected so far. With one eligible
   provider, delegate directly and return its error unchanged.

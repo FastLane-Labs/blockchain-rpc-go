@@ -6,9 +6,9 @@ import "context"
 // MultiRpcClientConfig or the signatures of existing constructors.
 type MultiRpcClientOptions struct {
 	// ParallelCalls races calls and batches across all healthy, capable providers.
-	// The first result or non-transport error wins, regardless of RPC error codes
-	// or messages. Malformed or misshapen provider responses count as transport
-	// failures. All-transport failures are aggregated. Results are decoded once.
+	// The first answer wins, whether a result or an error of any kind, except a
+	// timeout (context.DeadlineExceeded), which waits for another copy. All-timeout
+	// failures are aggregated. Results are decoded once.
 	// Ordinary losing copies are canceled; eth_sendRawTransaction and batches
 	// containing it continue under the caller's context. Like the default
 	// broadcast, eth_sendRawTransaction calls return the first success and only

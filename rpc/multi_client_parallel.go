@@ -71,12 +71,12 @@ func (c *MultiRpcClient) batchCallContextParallel(ctx context.Context, b []rpc.B
 				return parallelBatchErrors(b, failures, requestCtx.Err())
 			default:
 			}
-			if !isParallelTransportError(res.err) {
+			if !isParallelTimeout(res.err) {
 				if res.err != nil {
 					return res.err
 				}
-				// Geth reports transport failures for the whole batch. Element
-				// errors are RPC outcomes; accept this batch and decode it once.
+				// Geth reports timeouts for the whole batch. Element errors are
+				// RPC outcomes; accept this batch and decode it once.
 				for i := range res.batch {
 					b[i].Error = res.batch[i].Error
 					if b[i].Error == nil {

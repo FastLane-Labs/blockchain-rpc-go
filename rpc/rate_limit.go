@@ -15,8 +15,8 @@ var (
 	ErrMaxConcurrencyExceeded = errors.New("max concurrency exceeded")
 )
 
-// The limiter can reject a wait before the context expires. Its untyped error
-// must remain distinguishable from an RPC response when racing providers.
+// The limiter rejects a wait that would exceed the deadline before the context
+// expires. Parallel calls treat its untyped error as that copy's timeout.
 type rateLimitWaitError struct{ error }
 
 func (e rateLimitWaitError) Unwrap() error { return e.error }

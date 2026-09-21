@@ -2,25 +2,20 @@ package rpc
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"net/http/httptest"
-	"reflect"
+	"net/url"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
 	gethrpc "github.com/ethereum/go-ethereum/rpc"
-	"github.com/gorilla/websocket"
 	"golang.org/x/time/rate"
 )
 
@@ -33,46 +28,31 @@ func (e rpcOutcomeError) Error() string  { return e.message }
 func (e rpcOutcomeError) ErrorCode() int { return e.code }
 func (e rpcOutcomeError) ErrorData() any { return "0x12345678" }
 
-func TestParallelTransportErrorClassification(t *testing.T) {
+func TestParallelTimeoutClassification(t *testing.T) {
 	for _, tc := range []struct {
-		name      string
-		err       error
-		transport bool
+		name    string
+		err     error
+		timeout bool
 	}{
 		{"success", nil, false},
 		{"deadline", context.DeadlineExceeded, true},
-		{"canceled provider", context.Canceled, true},
-		{"connection reset", &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET}, true},
-		{"EOF", io.EOF, true},
-		{"truncated stream", io.ErrUnexpectedEOF, true},
-		{"closed pipe", io.ErrClosedPipe, true},
-		{"closed connection", net.ErrClosed, true},
-		{"closed client", gethrpc.ErrClientQuit, true},
-		{"HTTP failure", gethrpc.HTTPError{StatusCode: 503, Status: "unavailable"}, true},
-		{"websocket close", &websocket.CloseError{Code: websocket.CloseAbnormalClosure}, true},
-		{"websocket write after close", websocket.ErrCloseSent, true},
-		{"websocket handshake", websocket.ErrBadHandshake, true},
-		{"TLS certificate failure", &tls.CertificateVerificationError{Err: x509.UnknownAuthorityError{}}, true},
-		{"TLS protocol failure", tls.RecordHeaderError{Msg: "first record does not look like a TLS handshake"}, true},
-		{"malformed JSON", &json.SyntaxError{Offset: 12}, true},
-		{"misshapen JSON-RPC", &json.UnmarshalTypeError{Value: "array", Type: reflect.TypeOf("")}, true},
-		{"missing result field", gethrpc.ErrNoResult, true},
-		{"geth reconnection", errors.New("client reconnected"), true},
-		{"geth dead connection", errors.New("connection lost"), true},
-		{"ordinary error", errors.New("application error"), false},
-		{"timeout text only", errors.New("context deadline exceeded"), false},
-		{"RPC revert", rpcOutcomeError{3, "execution reverted"}, false},
+		{"HTTP deadline", &url.Error{Op: "Post", URL: "http://provider", Err: context.DeadlineExceeded}, true},
+		{"limiter deadline", rateLimitWaitError{errors.New("rate: Wait(n=1) would exceed context deadline")}, true},
+		{"caller cancellation", context.Canceled, false},
+		{"connection reset", &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET}, false},
+		{"EOF", io.EOF, false},
+		{"HTTP failure", gethrpc.HTTPError{StatusCode: 503, Status: "unavailable"}, false},
+		{"malformed JSON", &json.SyntaxError{Offset: 12}, false},
+		{"closed client", gethrpc.ErrClientQuit, false},
+		{"deadline text only", errors.New("context deadline exceeded"), false},
 		{"RPC timeout", rpcOutcomeError{-32002, "request timed out"}, false},
-		{"RPC internal error", rpcOutcomeError{-32603, "internal error"}, false},
-		{"unknown RPC code", rpcOutcomeError{123456, "context deadline exceeded"}, false},
-		{"RPC connection message", rpcOutcomeError{-32000, "connection lost"}, false},
-		{"RPC reconnection message", rpcOutcomeError{-32000, "client reconnected"}, false},
+		{"RPC deadline message", rpcOutcomeError{-32000, "context deadline exceeded"}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := isParallelTransportError(tc.err); got != tc.transport {
-				t.Fatalf("transport=%v, want %v", got, tc.transport)
+			if got := isParallelTimeout(tc.err); got != tc.timeout {
+				t.Fatalf("timeout=%v, want %v", got, tc.timeout)
 			}
-			if tc.err != nil && isParallelTransportError(fmt.Errorf("wrapped: %w", tc.err)) != tc.transport {
+			if tc.err != nil && isParallelTimeout(fmt.Errorf("wrapped: %w", tc.err)) != tc.timeout {
 				t.Fatal("wrapping changed classification")
 			}
 		})
@@ -141,31 +121,76 @@ func TestParallelRPCErrorWinsUnchanged(t *testing.T) {
 	}
 }
 
-func TestParallelWaitsAfterTransportFailure(t *testing.T) {
+func TestParallelWaitsAfterTimeout(t *testing.T) {
 	for _, batch := range []bool{false, true} {
-		for _, cause := range []error{context.DeadlineExceeded, io.EOF, &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET}} {
-			t.Run(fmt.Sprintf("batch=%v/error=%T", batch, cause), func(t *testing.T) {
-				failed := make(chan struct{})
+		t.Run(fmt.Sprintf("batch=%v", batch), func(t *testing.T) {
+			timedOut := make(chan struct{})
+			c := testMultiClient(t,
+				func(context.Context, testRequest) (any, error) { return nil, nil },
+				func(context.Context, testRequest) (any, error) { <-timedOut; return "winner", nil },
+			)
+			setTestTransport(t, c, 0, transportFunc(func(*http.Request) (*http.Response, error) {
+				close(timedOut)
+				return nil, context.DeadlineExceeded
+			}))
+			var result string
+			if batch {
+				b := []gethrpc.BatchElem{{Method: "eth_call", Result: &result}}
+				if err := c.BatchCallContext(testContext(t), b); err != nil || b[0].Error != nil {
+					t.Fatalf("failed to wait for working provider: %v %v", err, b[0].Error)
+				}
+			} else if err := c.CallContext(testContext(t), &result, "eth_call"); err != nil {
+				t.Fatal(err)
+			}
+			if result != "winner" {
+				t.Fatalf("got %q", result)
+			}
+		})
+	}
+}
+
+// Any answer other than a timeout ends the race, including transport failures
+// and malformed responses, and cancels the other copies.
+func TestParallelNonTimeoutFailureIsAnAnswer(t *testing.T) {
+	for _, batch := range []bool{false, true} {
+		for name, cause := range map[string]error{
+			"connection": io.ErrUnexpectedEOF,
+			"HTTP":       gethrpc.HTTPError{StatusCode: 503, Status: "503 unavailable"},
+		} {
+			t.Run(fmt.Sprintf("batch=%v/%s", batch, name), func(t *testing.T) {
+				started, canceled := make(chan struct{}), make(chan struct{})
 				c := testMultiClient(t,
 					func(context.Context, testRequest) (any, error) { return nil, nil },
-					func(context.Context, testRequest) (any, error) { <-failed; return "winner", nil },
+					func(ctx context.Context, _ testRequest) (any, error) {
+						close(started)
+						<-ctx.Done()
+						close(canceled)
+						return nil, ctx.Err()
+					},
 				)
-				setTestTransport(t, c, 0, transportFunc(func(*http.Request) (*http.Response, error) {
-					close(failed)
+				setTestTransport(t, c, 0, transportFunc(func(r *http.Request) (*http.Response, error) {
+					select {
+					case <-started:
+					case <-r.Context().Done():
+					}
+					if httpErr, ok := cause.(gethrpc.HTTPError); ok {
+						return &http.Response{StatusCode: httpErr.StatusCode, Status: httpErr.Status, Body: io.NopCloser(strings.NewReader(""))}, nil
+					}
 					return nil, cause
 				}))
-				var result string
+				ctx := testContext(t)
+				result := "unchanged"
+				var err error
 				if batch {
-					b := []gethrpc.BatchElem{{Method: "eth_call", Result: &result}}
-					if err := c.BatchCallContext(testContext(t), b); err != nil || b[0].Error != nil {
-						t.Fatalf("failed to wait for working provider: %v %v", err, b[0].Error)
-					}
-				} else if err := c.CallContext(testContext(t), &result, "eth_call"); err != nil {
-					t.Fatal(err)
+					err = c.BatchCallContext(ctx, []gethrpc.BatchElem{{Method: "eth_call", Result: &result}})
+				} else {
+					err = c.CallContext(ctx, &result, "eth_call")
 				}
-				if result != "winner" {
-					t.Fatalf("got %q", result)
+				var httpErr gethrpc.HTTPError
+				if err == nil || result != "unchanged" || (!errors.Is(err, cause) && !errors.As(err, &httpErr)) {
+					t.Fatalf("expected the failure to end the race: %q, %v", result, err)
 				}
+				receive(t, ctx, canceled)
 			})
 		}
 	}
@@ -260,52 +285,6 @@ func TestParallelBroadcastBatchContinuesAfterRPCError(t *testing.T) {
 	}
 	if err := receive(t, ctx, finished); err != nil {
 		t.Fatalf("losing broadcast was canceled: %v", err)
-	}
-}
-
-// A 2xx response with malformed or misshapen JSON-RPC is a provider failure,
-// like any other non-RPC error on the default path, not an answer.
-func TestParallelMalformedResponseIsProviderFailure(t *testing.T) {
-	for _, batch := range []bool{false, true} {
-		bodies := map[string]string{
-			"malformed":      `{"jsonrpc": definitely}`,
-			"truncated":      `{"jsonrpc":"2.0","id":1,"result":"0x`,
-			"missing result": `{"jsonrpc":"2.0","id":1}`,
-			"wrong shape":    `[]`,
-		}
-		if batch {
-			delete(bodies, "missing result")
-			bodies["wrong shape"] = `{"jsonrpc":"2.0","id":1,"result":"0x1"}`
-		}
-		for name, body := range bodies {
-			t.Run(fmt.Sprintf("batch=%v/%s", batch, name), func(t *testing.T) {
-				corrupted := make(chan struct{})
-				c := testMultiClient(t,
-					func(context.Context, testRequest) (any, error) { return nil, nil },
-					func(context.Context, testRequest) (any, error) { <-corrupted; return "winner", nil },
-				)
-				setTestTransport(t, c, 0, transportFunc(func(*http.Request) (*http.Response, error) {
-					close(corrupted)
-					return &http.Response{
-						StatusCode: http.StatusOK, Status: "200 OK",
-						Header: http.Header{"Content-Type": []string{"application/json"}},
-						Body:   io.NopCloser(strings.NewReader(body)),
-					}, nil
-				}))
-				var result string
-				if batch {
-					b := []gethrpc.BatchElem{{Method: "eth_call", Result: &result}}
-					if err := c.BatchCallContext(testContext(t), b); err != nil || b[0].Error != nil {
-						t.Fatalf("corrupt provider ended the batch: %v %v", err, b[0].Error)
-					}
-				} else if err := c.CallContext(testContext(t), &result, "eth_call"); err != nil {
-					t.Fatalf("corrupt provider ended the call: %v", err)
-				}
-				if result != "winner" {
-					t.Fatalf("got %q", result)
-				}
-			})
-		}
 	}
 }
 
@@ -420,44 +399,5 @@ func TestParallelSkipsExhaustedRateLimit(t *testing.T) {
 				t.Fatalf("local limiter failure won: %q, %v", result, err)
 			}
 		})
-	}
-}
-
-func TestParallelWebSocketReconnectFailure(t *testing.T) {
-	var first atomic.Bool
-	upgrader := websocket.Upgrader{}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if first.Swap(true) {
-			http.Error(w, "unavailable", http.StatusServiceUnavailable)
-			return
-		}
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			t.Error(err)
-			return
-		}
-		defer conn.Close()
-		// Disconnect on the first request; subsequent handshakes are rejected.
-		_, _, _ = conn.ReadMessage()
-	}))
-	defer server.Close()
-	ws, err := gethrpc.DialContext(testContext(t), "ws"+strings.TrimPrefix(server.URL, "http"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	c := testMultiClient(t,
-		func(context.Context, testRequest) (any, error) { return nil, nil },
-		func(context.Context, testRequest) (any, error) {
-			time.Sleep(10 * time.Millisecond)
-			return "winner", nil
-		},
-	)
-	c.allClients[0].rpcClient.c.Close()
-	c.allClients[0].rpcClient.c = ws
-	for range 2 {
-		var result string
-		if err := c.CallContext(testContext(t), &result, "eth_call"); err != nil || result != "winner" {
-			t.Fatalf("websocket connection failure won: %q, %v", result, err)
-		}
 	}
 }
