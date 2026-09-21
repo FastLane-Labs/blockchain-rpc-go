@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -166,51 +167,95 @@ func TestParallelWaitsAfterTransportFailure(t *testing.T) {
 	}
 }
 
-func TestParallelBroadcastContinuesAfterRPCError(t *testing.T) {
-	for _, batch := range []bool{false, true} {
-		t.Run(fmt.Sprintf("batch=%v", batch), func(t *testing.T) {
+func TestParallelBroadcastWaitsForSuccess(t *testing.T) {
+	for _, allFail := range []bool{false, true} {
+		t.Run(fmt.Sprintf("allFail=%v", allFail), func(t *testing.T) {
 			ctx := testContext(t)
 			started, release := make(chan struct{}), make(chan struct{})
-			defer close(release)
-			finished := make(chan error, 1)
+			var releaseOnce sync.Once
+			defer releaseOnce.Do(func() { close(release) })
 			c := testMultiClient(t,
 				func(context.Context, testRequest) (any, error) { <-started; return nil, revertError{} },
-				func(context.Context, testRequest) (any, error) { return nil, nil },
+				func(ctx context.Context, _ testRequest) (any, error) {
+					close(started)
+					<-release
+					if ctx.Err() != nil {
+						t.Error("slow broadcast was canceled")
+					}
+					if allFail {
+						return nil, rpcOutcomeError{-32000, "nonce too low"}
+					}
+					return "0xhash", nil
+				},
 			)
-			setTestTransport(t, c, 1, transportFunc(func(r *http.Request) (*http.Response, error) {
-				close(started)
-				select {
-				case <-release:
-				case <-r.Context().Done():
-				}
-				finished <- r.Context().Err()
-				return nil, io.EOF
-			}))
-			var err error
-			if batch {
-				var result string
-				b := []gethrpc.BatchElem{{Method: "eth_sendRawTransaction", Result: &result}}
-				if err = c.BatchCallContext(ctx, b); err != nil {
-					t.Fatal(err)
-				}
-				err = b[0].Error
-			} else {
-				err = c.CallContext(ctx, nil, "eth_sendRawTransaction")
-			}
-			if _, ok := err.(gethrpc.Error); !ok {
-				t.Fatalf("expected first RPC error, got %v", err)
-			}
+			var result string
+			returned := make(chan error, 1)
+			go func() { returned <- c.CallContext(ctx, &result, "eth_sendRawTransaction") }()
+			receive(t, ctx, started)
+			// The fast rejection is delivered while the slow provider is still held.
 			select {
-			case release <- struct{}{}:
-			case err := <-finished:
-				t.Fatalf("broadcast canceled before release: %v", err)
-			case <-ctx.Done():
-				t.Fatal(ctx.Err())
+			case err := <-returned:
+				t.Fatalf("broadcast ended on first RPC error: %v", err)
+			case <-time.After(100 * time.Millisecond):
 			}
-			if err := receive(t, ctx, finished); err != nil {
-				t.Fatalf("losing broadcast was canceled: %v", err)
+			releaseOnce.Do(func() { close(release) })
+			err := receive(t, ctx, returned)
+			if !allFail {
+				if err != nil || result != "0xhash" {
+					t.Fatalf("expected the later acceptance, got %q, %v", result, err)
+				}
+				return
+			}
+			var rpcErr gethrpc.Error
+			if !errors.As(err, &rpcErr) || result != "" {
+				t.Fatalf("expected aggregated RPC errors, got %q, %v", result, err)
+			}
+			for _, want := range []string{"provider-0: execution reverted", "provider-1: nonce too low"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("missing %q in %v", want, err)
+				}
 			}
 		})
+	}
+}
+
+// A batch containing a transaction still selects the first RPC outcome. Its
+// losing copies must not be canceled.
+func TestParallelBroadcastBatchContinuesAfterRPCError(t *testing.T) {
+	ctx := testContext(t)
+	started, release := make(chan struct{}), make(chan struct{})
+	defer close(release)
+	finished := make(chan error, 1)
+	c := testMultiClient(t,
+		func(context.Context, testRequest) (any, error) { <-started; return nil, revertError{} },
+		func(context.Context, testRequest) (any, error) { return nil, nil },
+	)
+	setTestTransport(t, c, 1, transportFunc(func(r *http.Request) (*http.Response, error) {
+		close(started)
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+		finished <- r.Context().Err()
+		return nil, io.EOF
+	}))
+	var result string
+	b := []gethrpc.BatchElem{{Method: "eth_sendRawTransaction", Result: &result}}
+	if err := c.BatchCallContext(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := b[0].Error.(gethrpc.Error); !ok {
+		t.Fatalf("expected first RPC error, got %v", b[0].Error)
+	}
+	select {
+	case release <- struct{}{}:
+	case err := <-finished:
+		t.Fatalf("broadcast canceled before release: %v", err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	if err := receive(t, ctx, finished); err != nil {
+		t.Fatalf("losing broadcast was canceled: %v", err)
 	}
 }
 

@@ -9,7 +9,9 @@ type MultiRpcClientOptions struct {
 	// The first result or non-transport error wins, regardless of RPC error codes
 	// or messages. All-transport failures are aggregated. Results are decoded once.
 	// Ordinary losing copies are canceled; eth_sendRawTransaction and batches
-	// containing it continue under the caller's context.
+	// containing it continue under the caller's context. Like the default
+	// broadcast, eth_sendRawTransaction calls return the first success and only
+	// fail, with every provider's error, once all providers have failed.
 	// Weights and HTTP preference do not restrict the race. Provider limits still
 	// apply, and fan-out increases their load. Subscriptions and notifications
 	// retain their existing behavior. The zero value preserves default selection.

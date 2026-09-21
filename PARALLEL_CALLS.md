@@ -29,6 +29,11 @@ Zero-valued options preserve the default behavior.
   their provider. `eth_sendRawTransaction` copies and batches containing one
   continue under the caller's context. Single transaction calls include send-only
   providers; batches use read-capable providers.
+- Keep the default broadcast semantics for `eth_sendRawTransaction` calls: return
+  the first success, and only fail once every provider has failed, aggregating
+  their errors with provider IDs. A fast `already known` or `nonce too low`
+  rejection never hides a later acceptance. Batches containing a transaction
+  still select the first response without an overall transport failure.
 - Aggregate all transport failures with provider IDs when no provider answers.
   `errors.Is` / `errors.As` preserve their causes. Caller cancellation/deadline
   stops waiting promptly, with errors collected so far. With one eligible

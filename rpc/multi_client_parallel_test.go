@@ -137,7 +137,7 @@ func TestParallelCallFirstSuccess(t *testing.T) {
 			slowDone := make(chan struct{})
 			var handlers []testHandler
 			for i := range release {
-				handlers = append(handlers, func(_ context.Context, req testRequest) (any, error) {
+				handlers = append(handlers, func(ctx context.Context, req testRequest) (any, error) {
 					if req.Method != method || len(req.Params) != 1 || req.Params[0] != "payload" {
 						t.Errorf("unexpected request: %+v", req)
 					}
@@ -147,6 +147,9 @@ func TestParallelCallFirstSuccess(t *testing.T) {
 						return nil, errors.New("execution reverted")
 					}
 					if i == 2 {
+						if method == "eth_sendRawTransaction" && ctx.Err() != nil {
+							t.Error("losing broadcast was canceled")
+						}
 						close(slowDone)
 					}
 					return fmt.Sprintf("result-%d", i), nil
@@ -175,8 +178,8 @@ func TestParallelCallFirstSuccess(t *testing.T) {
 			for range release {
 				receive(t, ctx, started)
 			}
-			if !tc.parallel {
-				// The legacy broadcast still ignores RPC errors until success.
+			if method == "eth_sendRawTransaction" {
+				// Broadcasts ignore RPC errors until success in both modes.
 				close(release[0])
 			}
 			close(release[1])

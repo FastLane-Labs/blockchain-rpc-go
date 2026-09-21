@@ -113,15 +113,19 @@ func (c *MultiRpcClient) callContextFirstResponse(ctx context.Context, result an
 				return parallelErrors(method, failures, requestCtx.Err())
 			default:
 			}
-			if !isParallelTransportError(res.err) {
-				if res.err != nil || !needsResult {
-					return res.err
-				}
-				// Choose the response before decoding, so only one provider can
-				// ever write to the caller's receiver, even when decoding fails.
-				return json.Unmarshal(res.raw, result)
+			// Broadcasts keep the default first-success semantics: a provider
+			// rejecting a transaction (already known, nonce too low) must not end
+			// the race while another provider may still accept it.
+			if res.err != nil && (broadcast || isParallelTransportError(res.err)) {
+				failures = append(failures, res)
+				continue
 			}
-			failures = append(failures, res)
+			if res.err != nil || !needsResult {
+				return res.err
+			}
+			// Choose the response before decoding, so only one provider can
+			// ever write to the caller's receiver, even when decoding fails.
+			return json.Unmarshal(res.raw, result)
 		case <-done:
 			return parallelErrors(method, failures, requestCtx.Err())
 		}
@@ -129,8 +133,9 @@ func (c *MultiRpcClient) callContextFirstResponse(ctx context.Context, result an
 	return parallelErrors(method, failures, nil)
 }
 
-// Format only exhausted transport failures. Accepted RPC errors are returned
-// unchanged, preserving their public interfaces and error data.
+// Format exhausted failures: transport failures, or every provider's rejection
+// of a broadcast. Accepted RPC errors are returned unchanged, preserving their
+// public interfaces and error data.
 func parallelErrors(method string, failures []parallelResponse, cause error) error {
 	errs := make([]error, 0, len(failures)+1)
 	for _, res := range failures {
