@@ -56,7 +56,7 @@ type parallelResponse struct {
 	err    error
 }
 
-func (c *MultiRpcClient) callContextFirstResponse(ctx context.Context, result any, method string, args ...any) error {
+func (c *MultiRpcClient) callContextConcurrent(ctx context.Context, result any, method string, args ...any) error {
 	var storage [8]*internalRpcClient
 	broadcast := method == "eth_sendRawTransaction"
 	clients := c.parallelClients(storage[:0], strings.HasSuffix(method, subscribeMethodSuffix), broadcast)
@@ -65,6 +65,11 @@ func (c *MultiRpcClient) callContextFirstResponse(ctx context.Context, result an
 	}
 	if len(clients) == 1 {
 		// No extra copying, serialization, goroutine or channel is needed.
+		if !broadcast {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithDeadline(ctx, c.parallelDeadline())
+			defer cancel()
+		}
 		return clients[0].rpcClient.CallContext(ctx, result, method, args...)
 	}
 	if result != nil {
@@ -83,51 +88,52 @@ func (c *MultiRpcClient) callContextFirstResponse(ctx context.Context, result an
 		requestCtx, cancel = context.WithCancel(ctx)
 		defer cancel()
 	}
-	responses := make(chan parallelResponse, len(clients))
+	groups := groupParallelClients[parallelResponse](clients, !broadcast)
 	done := requestCtx.Done()
 	needsResult := result != nil
-	for _, client := range clients {
-		go func(client *internalRpcClient, ctx context.Context) {
-			res := parallelResponse{client: client}
-			select {
-			case <-done:
-				return
-			default:
-			}
-			if needsResult {
-				var raw json.RawMessage
-				res.err = client.rpcClient.CallContext(ctx, &raw, method, encodedArgs...)
-				res.raw = raw
-			} else {
-				res.err = client.rpcClient.CallContext(ctx, nil, method, encodedArgs...)
-			}
-			responses <- res
-		}(client, requestCtx)
+	deadline := c.parallelDeadline()
+	for _, group := range groups {
+		for _, client := range group.clients {
+			go func(ctx context.Context) {
+				if !broadcast {
+					var cancel context.CancelFunc
+					ctx, cancel = context.WithDeadline(ctx, deadline)
+					defer cancel()
+				}
+				res := parallelResponse{client: client}
+				if res.err = ctx.Err(); res.err == nil {
+					if needsResult {
+						res.err = client.rpcClient.CallContext(ctx, &res.raw, method, encodedArgs...)
+					} else {
+						res.err = client.rpcClient.CallContext(ctx, nil, method, encodedArgs...)
+					}
+				}
+				group.responses <- res
+			}(requestCtx)
+		}
 	}
 	var failures []parallelResponse
-	for range clients {
-		select {
-		case res := <-responses:
+	for _, group := range groups {
+		for range group.clients {
 			select {
+			case res := <-group.responses:
+				if err := requestCtx.Err(); err != nil {
+					return parallelErrors(method, failures, err)
+				}
+				// Broadcasts keep the default first-success semantics: a provider
+				// rejecting a transaction must not hide another provider's acceptance.
+				if res.err != nil && (broadcast || isParallelTimeout(res.err)) {
+					failures = append(failures, res)
+					continue
+				}
+				if res.err != nil || !needsResult {
+					return res.err
+				}
+				// Decode only the chosen response, on the caller's goroutine.
+				return json.Unmarshal(res.raw, result)
 			case <-done:
 				return parallelErrors(method, failures, requestCtx.Err())
-			default:
 			}
-			// Broadcasts keep the default first-success semantics: a provider
-			// rejecting a transaction (already known, nonce too low) must not end
-			// the race while another provider may still accept it.
-			if res.err != nil && (broadcast || isParallelTimeout(res.err)) {
-				failures = append(failures, res)
-				continue
-			}
-			if res.err != nil || !needsResult {
-				return res.err
-			}
-			// Choose the response before decoding, so only one provider can
-			// ever write to the caller's receiver, even when decoding fails.
-			return json.Unmarshal(res.raw, result)
-		case <-done:
-			return parallelErrors(method, failures, requestCtx.Err())
 		}
 	}
 	return parallelErrors(method, failures, nil)

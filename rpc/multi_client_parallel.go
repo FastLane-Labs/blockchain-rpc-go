@@ -23,20 +23,27 @@ func (c *MultiRpcClient) batchCallContextParallel(ctx context.Context, b []rpc.B
 	if len(clients) == 0 {
 		return ErrNoAvailableClients
 	}
+	broadcast := false
+	for _, elem := range b {
+		broadcast = broadcast || elem.Method == "eth_sendRawTransaction"
+	}
 	if len(clients) == 1 {
+		if !broadcast {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithDeadline(ctx, c.parallelDeadline())
+			defer cancel()
+		}
 		return clients[0].rpcClient.BatchCallContext(ctx, b)
 	}
 	// Snapshot metadata and encode inputs once. Workers never access b or any
 	// mutable arguments after ownership has returned to the caller.
 	template := make([]rpc.BatchElem, len(b))
-	broadcast := false
 	for i, elem := range b {
 		args, err := parallelArgs(elem.Args)
 		if err != nil {
 			return err
 		}
 		template[i] = rpc.BatchElem{Method: elem.Method, Args: args}
-		broadcast = broadcast || elem.Method == "eth_sendRawTransaction"
 	}
 	requestCtx := ctx
 	if !broadcast {
@@ -44,50 +51,56 @@ func (c *MultiRpcClient) batchCallContextParallel(ctx context.Context, b []rpc.B
 		requestCtx, cancel = context.WithCancel(ctx)
 		defer cancel()
 	}
-	responses := make(chan parallelBatchResponse, len(clients))
+	groups := groupParallelClients[parallelBatchResponse](clients, !broadcast)
 	done := requestCtx.Done()
-	for _, client := range clients {
-		go func(ctx context.Context) {
-			select {
-			case <-done:
-				return
-			default:
-			}
-			res := parallelBatchResponse{client: client, batch: make([]rpc.BatchElem, len(template)), raw: make([]json.RawMessage, len(template))}
-			copy(res.batch, template)
-			for i := range res.batch {
-				res.batch[i].Result = &res.raw[i]
-			}
-			res.err = client.rpcClient.BatchCallContext(ctx, res.batch)
-			responses <- res
-		}(requestCtx)
+	deadline := c.parallelDeadline()
+	for _, group := range groups {
+		for _, client := range group.clients {
+			go func(ctx context.Context) {
+				if !broadcast {
+					var cancel context.CancelFunc
+					ctx, cancel = context.WithDeadline(ctx, deadline)
+					defer cancel()
+				}
+				res := parallelBatchResponse{client: client}
+				if res.err = ctx.Err(); res.err == nil {
+					res.batch = make([]rpc.BatchElem, len(template))
+					res.raw = make([]json.RawMessage, len(template))
+					copy(res.batch, template)
+					for i := range res.batch {
+						res.batch[i].Result = &res.raw[i]
+					}
+					res.err = client.rpcClient.BatchCallContext(ctx, res.batch)
+				}
+				group.responses <- res
+			}(requestCtx)
+		}
 	}
 	var failures []parallelResponse
-	for range clients {
-		select {
-		case res := <-responses:
+	for _, group := range groups {
+		for range group.clients {
 			select {
+			case res := <-group.responses:
+				if err := requestCtx.Err(); err != nil {
+					return parallelBatchErrors(b, failures, err)
+				}
+				if !isParallelTimeout(res.err) {
+					if res.err != nil {
+						return res.err
+					}
+					// Select one provider's complete batch, preserving element errors.
+					for i := range res.batch {
+						b[i].Error = res.batch[i].Error
+						if b[i].Error == nil {
+							b[i].Error = json.Unmarshal(res.raw[i], b[i].Result)
+						}
+					}
+					return nil
+				}
+				failures = append(failures, parallelResponse{client: res.client, err: res.err})
 			case <-done:
 				return parallelBatchErrors(b, failures, requestCtx.Err())
-			default:
 			}
-			if !isParallelTimeout(res.err) {
-				if res.err != nil {
-					return res.err
-				}
-				// Geth reports timeouts for the whole batch. Element errors are
-				// RPC outcomes; accept this batch and decode it once.
-				for i := range res.batch {
-					b[i].Error = res.batch[i].Error
-					if b[i].Error == nil {
-						b[i].Error = json.Unmarshal(res.raw[i], b[i].Result)
-					}
-				}
-				return nil
-			}
-			failures = append(failures, parallelResponse{client: res.client, err: res.err})
-		case <-done:
-			return parallelBatchErrors(b, failures, requestCtx.Err())
 		}
 	}
 	return parallelBatchErrors(b, failures, nil)

@@ -217,6 +217,8 @@ func TestParallelBroadcastWaitsForSuccess(t *testing.T) {
 					return "0xhash", nil
 				},
 			)
+			c.parallelCallTimeout = time.Nanosecond // Read-attempt timeouts must not limit broadcasts.
+			c.allClients[0].rpcClient.weight = 100
 			var result string
 			returned := make(chan error, 1)
 			go func() { returned <- c.CallContext(ctx, &result, "eth_sendRawTransaction") }()
@@ -259,6 +261,8 @@ func TestParallelBroadcastBatchContinuesAfterRPCError(t *testing.T) {
 		func(context.Context, testRequest) (any, error) { <-started; return nil, revertError{} },
 		func(context.Context, testRequest) (any, error) { return nil, nil },
 	)
+	c.parallelCallTimeout = time.Nanosecond
+	c.allClients[1].rpcClient.weight = 100 // Mixed batches still select by arrival.
 	setTestTransport(t, c, 1, transportFunc(func(r *http.Request) (*http.Response, error) {
 		close(started)
 		select {
