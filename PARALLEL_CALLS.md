@@ -29,8 +29,11 @@ Zero-valued options preserve the default behavior.
   connection, an HTTP status error, or a malformed response are answers too.
 - Discard only timeouts. A copy that failed with Go's `context.DeadlineExceeded`
   ("context deadline exceeded"), or whose local rate-limit wait would exceed the
-  deadline, waits for another copy. An RPC error saying "request timed out" is
-  still an answer.
+  deadline, waits for another copy. A network timeout returned at or after the
+  attempt's deadline also qualifies, including WebSocket handshake I/O timeouts.
+  These errors retain their transport cause and match `context.DeadlineExceeded`
+  through `errors.Is`. Earlier network timeouts and RPC errors saying "request
+  timed out" remain answers; error text alone never enables fallback.
 - Read batches select one provider's complete response using the same weight
   ordering, then decode its elements once. Element errors stay in
   `BatchElem.Error`; results from different providers are never combined.
@@ -41,9 +44,9 @@ Zero-valued options preserve the default behavior.
 - Keep the default broadcast semantics for `eth_sendRawTransaction` calls: return
   the first success, and only fail once every provider has failed, aggregating
   their errors with provider IDs. A fast `already known` or `nonce too low`
-  rejection never hides a later acceptance. Batches containing a transaction
-  still select the first response without an overall timeout, regardless of
-  weights. Both broadcast paths use only the caller's deadline.
+  rejection or malformed transaction hash never hides a later acceptance.
+  Batches containing a transaction still select the first non-timeout batch,
+  regardless of weights. Both broadcast paths use only the caller's deadline.
 - Aggregate all timeouts with provider IDs when no provider answers.
   `errors.Is` / `errors.As` preserve their causes. Caller cancellation/deadline
   stops waiting promptly, with errors collected so far. With one eligible
@@ -52,10 +55,18 @@ Zero-valued options preserve the default behavior.
 - Subscription and notification APIs retain their existing behavior.
 
 Mutable arguments are encoded before starting workers. Workers never write to
-caller-owned results; only the chosen response is decoded, on the calling
-goroutine. Decode errors end the call without trying another provider, preserving
-normal JSON decoder behavior for initialized receivers, maps, and custom codecs.
+caller-owned results. Ordinary calls and batches decode only the chosen response,
+on the calling goroutine. Their decode errors end selection without trying
+another provider, preserving normal JSON decoder behavior for initialized
+receivers, maps, and custom codecs.
 Valid JSON `null` is accepted; later method-specific checks in `eth` are unchanged.
+
+Like the default transaction broadcast, multi-provider `eth_sendRawTransaction`
+calls decode each response into a private, zero-valued receiver of the caller's
+result type. A decode failure counts as that provider's failure; only a successfully
+decoded result is copied to the caller. Custom broadcast decoders must work on
+zero-valued receivers and may run concurrently. Batches containing transactions
+continue to select a whole batch before decoding its elements.
 
 ## Deadlines
 

@@ -72,6 +72,9 @@ func (c *MultiRpcClient) batchCallContextParallel(ctx context.Context, b []rpc.B
 					}
 					res.err = client.rpcClient.BatchCallContext(ctx, res.batch)
 				}
+				if !broadcast {
+					res.err = parallelAttemptError(ctx, res.err)
+				}
 				group.responses <- res
 			}(requestCtx)
 		}

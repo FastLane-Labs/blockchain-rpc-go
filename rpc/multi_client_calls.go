@@ -53,6 +53,7 @@ func parallelArgs(args []any) ([]any, error) {
 type parallelResponse struct {
 	client *internalRpcClient
 	raw    json.RawMessage
+	value  reflect.Value // Private decoded result for a transaction broadcast.
 	err    error
 }
 
@@ -72,11 +73,13 @@ func (c *MultiRpcClient) callContextConcurrent(ctx context.Context, result any, 
 		}
 		return clients[0].rpcClient.CallContext(ctx, result, method, args...)
 	}
+	var resultType reflect.Type
 	if result != nil {
 		v := reflect.ValueOf(result)
 		if v.Kind() != reflect.Pointer || v.IsNil() {
 			return &json.InvalidUnmarshalError{Type: v.Type()}
 		}
+		resultType = v.Type().Elem()
 	}
 	encodedArgs, err := parallelArgs(args)
 	if err != nil {
@@ -102,11 +105,19 @@ func (c *MultiRpcClient) callContextConcurrent(ctx context.Context, result any, 
 				}
 				res := parallelResponse{client: client}
 				if res.err = ctx.Err(); res.err == nil {
-					if needsResult {
+					if broadcast && needsResult {
+						// Match the default broadcast: a response succeeds only if
+						// it decodes, and failed/late decoders cannot touch result.
+						res.value = reflect.New(resultType)
+						res.err = client.rpcClient.CallContext(ctx, res.value.Interface(), method, encodedArgs...)
+					} else if needsResult {
 						res.err = client.rpcClient.CallContext(ctx, &res.raw, method, encodedArgs...)
 					} else {
 						res.err = client.rpcClient.CallContext(ctx, nil, method, encodedArgs...)
 					}
+				}
+				if !broadcast {
+					res.err = parallelAttemptError(ctx, res.err)
 				}
 				group.responses <- res
 			}(requestCtx)
@@ -123,11 +134,15 @@ func (c *MultiRpcClient) callContextConcurrent(ctx context.Context, result any, 
 				// Broadcasts keep the default first-success semantics: a provider
 				// rejecting a transaction must not hide another provider's acceptance.
 				if res.err != nil && (broadcast || isParallelTimeout(res.err)) {
-					failures = append(failures, res)
+					failures = append(failures, parallelResponse{client: res.client, err: res.err})
 					continue
 				}
 				if res.err != nil || !needsResult {
 					return res.err
+				}
+				if broadcast {
+					reflect.ValueOf(result).Elem().Set(res.value.Elem())
+					return nil
 				}
 				// Decode only the chosen response, on the caller's goroutine.
 				return json.Unmarshal(res.raw, result)

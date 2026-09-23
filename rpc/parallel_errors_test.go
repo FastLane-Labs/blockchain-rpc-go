@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"syscall"
@@ -54,6 +55,62 @@ func TestParallelTimeoutClassification(t *testing.T) {
 			}
 			if tc.err != nil && isParallelTimeout(fmt.Errorf("wrapped: %w", tc.err)) != tc.timeout {
 				t.Fatal("wrapping changed classification")
+			}
+		})
+	}
+}
+
+// Socket deadlines can expire before the context's cancellation timer runs.
+type pendingDeadlineContext struct {
+	context.Context
+	deadline time.Time
+}
+
+func (c pendingDeadlineContext) Deadline() (time.Time, bool) { return c.deadline, true }
+
+func TestParallelAttemptDeadlineErrors(t *testing.T) {
+	ctx := context.Background()
+	expired, cancel := context.WithDeadline(ctx, time.Now().Add(-time.Second))
+	defer cancel()
+	pending := pendingDeadlineContext{Context: ctx, deadline: time.Now().Add(-time.Second)}
+	future := pendingDeadlineContext{Context: ctx, deadline: time.Now().Add(time.Hour)}
+	canceled, stop := context.WithCancel(future)
+	stop()
+	transportErr := &net.OpError{Op: "read", Net: "tcp", Err: os.ErrDeadlineExceeded}
+	wrapped := fmt.Errorf("handshake: %w", transportErr)
+	for _, tc := range []struct {
+		name       string
+		ctx        context.Context
+		err        error
+		normalized bool
+	}{
+		{"socket deadline", expired, transportErr, true},
+		{"wrapped socket deadline", expired, wrapped, true},
+		{"socket deadline before context timer", pending, wrapped, true},
+		{"early socket timeout", future, wrapped, false},
+		{"unbounded context", ctx, wrapped, false},
+		{"caller cancellation", canceled, context.Canceled, false},
+		{"canceled before deadline", canceled, wrapped, false},
+		{"context deadline", expired, context.DeadlineExceeded, false},
+		{"wrapped context deadline", expired, fmt.Errorf("HTTP: %w", context.DeadlineExceeded), false},
+		{"success after deadline", expired, nil, false},
+		{"EOF after deadline", expired, io.EOF, false},
+		{"reset after deadline", expired, &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET}, false},
+		{"RPC timeout after deadline", expired, rpcOutcomeError{-32002, "request timed out"}, false},
+		{"timeout text after deadline", expired, errors.New("i/o timeout"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parallelAttemptError(tc.ctx, tc.err)
+			if !tc.normalized {
+				if got != tc.err {
+					t.Fatalf("error changed: got %v, want original %v", got, tc.err)
+				}
+				return
+			}
+			var networkErr *net.OpError
+			if !isParallelTimeout(got) || !errors.Is(got, context.DeadlineExceeded) ||
+				!errors.Is(got, tc.err) || !errors.As(got, &networkErr) || networkErr != transportErr {
+				t.Fatalf("deadline classification or original transport cause lost: %v", got)
 			}
 		})
 	}

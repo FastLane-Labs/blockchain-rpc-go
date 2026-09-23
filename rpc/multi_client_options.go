@@ -15,11 +15,12 @@ type MultiRpcClientOptions struct {
 	// once, preferring responses from the highest configured weight. Equal weights
 	// race each other. A lower weight is considered only after every attempt at a
 	// higher weight times out. All other results and errors are returned unchanged.
-	// All-timeout failures are aggregated. Results are decoded once.
+	// All-timeout failures are aggregated. Ordinary results are decoded once.
 	// Ordinary losing copies are canceled; eth_sendRawTransaction and batches
 	// containing it continue under the caller's context. Like the default
 	// broadcast, eth_sendRawTransaction calls return the first success and only
-	// fail, with every provider's error, once all providers have failed.
+	// fail, with every provider's error, once all providers have failed. With multiple
+	// providers, broadcasts decode into private zero-valued receivers before success.
 	// Batches containing transactions select the first non-timeout batch, without
 	// weight preference. HTTP preference does not restrict concurrent calls.
 	// Provider limits still apply, and fan-out increases their load. Subscriptions
@@ -30,6 +31,7 @@ type MultiRpcClientOptions struct {
 	// ParallelCallTimeout limits each ordinary parallel provider attempt, including
 	// rate/concurrency queueing. Zero defaults to 2 seconds; negative values are
 	// invalid. All attempts share an absolute deadline but have independent contexts.
+	// Network timeouts at or after that deadline also qualify for fallback.
 	// The caller's deadline always takes precedence: allow more time than this
 	// timeout to select a buffered fallback after a preferred attempt expires.
 	// Ignored when ParallelCalls is false, for transaction broadcasts, and for
