@@ -99,10 +99,13 @@ func (c *RpcClient) _batchCallContext(ctx context.Context, b []rpc.BatchElem) er
 	err = c.c.BatchCallContext(ctx, b)
 
 	if c.metrics != nil {
-		c.metrics.RpcCallsDuration.WithLabelValues(c.id, "BatchCall").Observe(time.Since(start).Seconds())
+		superseded := isParallelCancellation(ctx, err)
+		if !superseded {
+			c.metrics.RpcCallsDuration.WithLabelValues(c.id, "BatchCall").Observe(time.Since(start).Seconds())
+		}
 		for _, elem := range b {
 			c.metrics.RpcMethodsCalls.WithLabelValues(c.id, elem.Method).Inc()
-			if elem.Error != nil {
+			if elem.Error != nil && !superseded {
 				c.metrics.Errors.WithLabelValues(c.id, elem.Method).Inc()
 			}
 		}
@@ -136,10 +139,12 @@ func (c *RpcClient) _callContext(ctx context.Context, result any, method string,
 	err = c.c.CallContext(ctx, result, method, args...)
 
 	if c.metrics != nil {
-		c.metrics.RpcCallsDuration.WithLabelValues(c.id, method).Observe(time.Since(start).Seconds())
 		c.metrics.RpcMethodsCalls.WithLabelValues(c.id, method).Inc()
-		if err != nil {
-			c.metrics.Errors.WithLabelValues(c.id, method).Inc()
+		if !isParallelCancellation(ctx, err) {
+			c.metrics.RpcCallsDuration.WithLabelValues(c.id, method).Observe(time.Since(start).Seconds())
+			if err != nil {
+				c.metrics.Errors.WithLabelValues(c.id, method).Inc()
+			}
 		}
 	}
 

@@ -76,7 +76,7 @@ func (c *RpcClient) advanceLimiter(ctx context.Context, nonBlocking bool) error 
 	}
 
 	if err := c.lim.Wait(ctx); err != nil {
-		if ctx.Err() == nil {
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			return rateLimitWaitError{err}
 		}
 		return err

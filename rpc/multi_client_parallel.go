@@ -2,117 +2,65 @@ package rpc
 
 import (
 	"context"
-	"encoding/json"
-
-	"github.com/ethereum/go-ethereum/rpc"
+	"errors"
+	"fmt"
 )
 
-type parallelBatchResponse struct {
+type parallelResponse[T any] struct {
 	client *internalRpcClient
-	batch  []rpc.BatchElem
-	raw    []json.RawMessage
+	value  T
 	err    error
 }
 
-func (c *MultiRpcClient) batchCallContextParallel(ctx context.Context, b []rpc.BatchElem, subscriptionRelated bool) error {
-	if len(b) == 0 {
-		return nil
-	}
-	var storage [8]*internalRpcClient
-	clients := c.parallelClients(storage[:0], subscriptionRelated, false)
+// Dispatch each eligible provider once, then consume responses by weight.
+// A single eligible provider uses the same deadline and error handling.
+func parallelCall[T any](ctx context.Context, c *MultiRpcClient, method string, attempt func(context.Context, *RpcClient) (T, error)) (T, error) {
+	var zero T
+	clients := c.eligibleClients(false, false)
 	if len(clients) == 0 {
-		return ErrNoAvailableClients
+		return zero, ErrNoAvailableClients
 	}
-	broadcast := false
-	for _, elem := range b {
-		broadcast = broadcast || elem.Method == "eth_sendRawTransaction"
-	}
-	if len(clients) == 1 {
-		if !broadcast {
-			var cancel context.CancelFunc
-			ctx, cancel = context.WithDeadline(ctx, c.parallelDeadline())
-			defer cancel()
-		}
-		return clients[0].rpcClient.BatchCallContext(ctx, b)
-	}
-	// Snapshot metadata and encode inputs once. Workers never access b or any
-	// mutable arguments after ownership has returned to the caller.
-	template := make([]rpc.BatchElem, len(b))
-	for i, elem := range b {
-		args, err := parallelArgs(elem.Args)
-		if err != nil {
-			return err
-		}
-		template[i] = rpc.BatchElem{Method: elem.Method, Args: args}
-	}
-	requestCtx := ctx
-	if !broadcast {
-		var cancel context.CancelFunc
-		requestCtx, cancel = context.WithCancel(ctx)
-		defer cancel()
-	}
-	groups := groupParallelClients[parallelBatchResponse](clients, !broadcast)
-	done := requestCtx.Done()
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(errParallelSuperseded)
 	deadline := c.parallelDeadline()
+	groups := groupParallelClients[parallelResponse[T]](clients)
 	for _, group := range groups {
 		for _, client := range group.clients {
-			go func(ctx context.Context) {
-				if !broadcast {
-					var cancel context.CancelFunc
-					ctx, cancel = context.WithDeadline(ctx, deadline)
-					defer cancel()
+			go func() {
+				attemptCtx, done := context.WithDeadline(ctx, deadline)
+				defer done()
+				res := parallelResponse[T]{client: client, err: attemptCtx.Err()}
+				if res.err == nil {
+					res.value, res.err = attempt(attemptCtx, client.rpcClient)
 				}
-				res := parallelBatchResponse{client: client}
-				if res.err = ctx.Err(); res.err == nil {
-					res.batch = make([]rpc.BatchElem, len(template))
-					res.raw = make([]json.RawMessage, len(template))
-					copy(res.batch, template)
-					for i := range res.batch {
-						res.batch[i].Result = &res.raw[i]
-					}
-					res.err = client.rpcClient.BatchCallContext(ctx, res.batch)
-				}
-				if !broadcast {
-					res.err = parallelAttemptError(ctx, res.err)
-				}
+				res.err = parallelAttemptError(attemptCtx, res.err)
 				group.responses <- res
-			}(requestCtx)
+			}()
 		}
 	}
-	var failures []parallelResponse
+	var failures []error
 	for _, group := range groups {
 		for range group.clients {
 			select {
 			case res := <-group.responses:
-				if err := requestCtx.Err(); err != nil {
-					return parallelBatchErrors(b, failures, err)
+				if err := ctx.Err(); err != nil {
+					return zero, parallelErrors(method, failures, err)
 				}
 				if !isParallelTimeout(res.err) {
-					if res.err != nil {
-						return res.err
-					}
-					// Select one provider's complete batch, preserving element errors.
-					for i := range res.batch {
-						b[i].Error = res.batch[i].Error
-						if b[i].Error == nil {
-							b[i].Error = json.Unmarshal(res.raw[i], b[i].Result)
-						}
-					}
-					return nil
+					return res.value, res.err
 				}
-				failures = append(failures, parallelResponse{client: res.client, err: res.err})
-			case <-done:
-				return parallelBatchErrors(b, failures, requestCtx.Err())
+				failures = append(failures, fmt.Errorf("%s: %w", res.client.rpcClient.id, res.err))
+			case <-ctx.Done():
+				return zero, parallelErrors(method, failures, ctx.Err())
 			}
 		}
 	}
-	return parallelBatchErrors(b, failures, nil)
+	return zero, parallelErrors(method, failures, nil)
 }
 
-func parallelBatchErrors(b []rpc.BatchElem, failures []parallelResponse, cause error) error {
-	err := parallelErrors("batch", failures, cause)
-	for i := range b {
-		b[i].Error = err
+func parallelErrors(method string, failures []error, cause error) error {
+	if cause != nil {
+		failures = append(failures, cause)
 	}
-	return err
+	return fmt.Errorf("RPC %s failed: %w", method, errors.Join(failures...))
 }

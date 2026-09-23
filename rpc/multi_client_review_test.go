@@ -35,7 +35,8 @@ func waitUntil(t *testing.T, ctx context.Context, condition func() bool) {
 }
 
 func TestParallelCallCancelsLoser(t *testing.T) {
-	ctx := testContext(t)
+	ctx, cancel := context.WithCancel(testContext(t))
+	defer cancel()
 	started := make(chan struct{})
 	canceled := make(chan struct{})
 	c := testMultiClient(t,
@@ -50,13 +51,16 @@ func TestParallelCallCancelsLoser(t *testing.T) {
 			return "winner", nil
 		},
 	)
+	c.parallelCallTimeout = time.Hour
 	c.allClients[0].rpcClient.sem = semaphore.NewWeighted(1)
 	var result string
 	if err := c.CallContext(ctx, &result, "eth_call"); err != nil {
 		t.Fatal(err)
 	}
-	receive(t, ctx, canceled)
-	waitUntil(t, ctx, func() bool { return c.allClients[0].rpcClient.queued.Load() == 0 })
+	observed, stop := context.WithTimeout(context.Background(), time.Second)
+	defer stop()
+	receive(t, observed, canceled)
+	waitUntil(t, observed, func() bool { return c.allClients[0].rpcClient.queued.Load() == 0 })
 	if !c.allClients[0].rpcClient.sem.TryAcquire(1) {
 		t.Fatal("losing call retained its concurrency slot")
 	}
@@ -64,7 +68,8 @@ func TestParallelCallCancelsLoser(t *testing.T) {
 }
 
 func TestParallelCallCancelsQueuedCopy(t *testing.T) {
-	ctx := testContext(t)
+	ctx, cancel := context.WithCancel(testContext(t))
+	defer cancel()
 	allowWinner := make(chan struct{})
 	defer close(allowWinner)
 	c := testMultiClient(t,
@@ -77,6 +82,7 @@ func TestParallelCallCancelsQueuedCopy(t *testing.T) {
 			return "winner", nil
 		},
 	)
+	c.parallelCallTimeout = time.Hour
 	slow := c.allClients[0].rpcClient
 	slow.sem = semaphore.NewWeighted(1)
 	if err := slow.sem.Acquire(ctx, 1); err != nil {
@@ -90,7 +96,9 @@ func TestParallelCallCancelsQueuedCopy(t *testing.T) {
 	if err := receive(t, ctx, returned); err != nil {
 		t.Fatal(err)
 	}
-	waitUntil(t, ctx, func() bool { return slow.queued.Load() == 0 })
+	observed, stop := context.WithTimeout(context.Background(), time.Second)
+	defer stop()
+	waitUntil(t, observed, func() bool { return slow.queued.Load() == 0 })
 }
 
 func TestParallelBatchCancellation(t *testing.T) {
@@ -116,6 +124,7 @@ func TestParallelBatchCancellation(t *testing.T) {
 					return "winner", nil
 				},
 			)
+			c.parallelCallTimeout = time.Hour
 			var result string
 			b := []gethrpc.BatchElem{{Method: "eth_call", Result: &result}}
 			err := c.BatchCallContext(ctx, b)
@@ -126,7 +135,9 @@ func TestParallelBatchCancellation(t *testing.T) {
 			} else if !errors.Is(err, context.Canceled) || !errors.Is(b[0].Error, context.Canceled) {
 				t.Fatalf("cancellation missing from batch/element errors: %v %v", err, b[0].Error)
 			}
-			receive(t, testContext(t), canceled)
+			observed, stop := context.WithTimeout(context.Background(), time.Second)
+			defer stop()
+			receive(t, observed, canceled)
 		})
 	}
 }
@@ -203,11 +214,11 @@ func TestParallelInitializedResults(t *testing.T) {
 			c := testMultiClient(t, handler, handler)
 			result := initializedResult{prefix: "existing-"}
 			if batch {
-				b := []gethrpc.BatchElem{{Method: "test_value", Result: &result}}
+				b := []gethrpc.BatchElem{{Method: "eth_call", Result: &result}}
 				if err := c.BatchCall(b); err != nil || b[0].Error != nil {
 					t.Fatalf("unexpected errors: %v %v", err, b[0].Error)
 				}
-			} else if err := c.Call(&result, "test_value"); err != nil {
+			} else if err := c.Call(&result, "eth_call"); err != nil {
 				t.Fatal(err)
 			}
 			if result.value != "existing-value" {
@@ -218,7 +229,7 @@ func TestParallelInitializedResults(t *testing.T) {
 	handler := func(context.Context, testRequest) (any, error) { return map[string]int{"new": 2}, nil }
 	c := testMultiClient(t, handler, handler)
 	result := map[string]int{"kept": 1}
-	if err := c.Call(&result, "test_value"); err != nil || result["kept"] != 1 || result["new"] != 2 {
+	if err := c.Call(&result, "eth_call"); err != nil || result["kept"] != 1 || result["new"] != 2 {
 		t.Fatalf("map decode semantics changed: %v, error: %v", result, err)
 	}
 }
@@ -249,13 +260,13 @@ func TestParallelDecodeErrorEndsRace(t *testing.T) {
 			result := countingResult{calls: &calls}
 			var err error
 			if batch {
-				b := []gethrpc.BatchElem{{Method: "test_value", Result: &result}}
+				b := []gethrpc.BatchElem{{Method: "eth_call", Result: &result}}
 				if err = c.BatchCallContext(testContext(t), b); err != nil {
 					t.Fatal(err)
 				}
 				err = b[0].Error
 			} else {
-				err = c.CallContext(testContext(t), &result, "test_value")
+				err = c.CallContext(testContext(t), &result, "eth_call")
 			}
 			var decodeErr *json.UnmarshalTypeError
 			if !errors.As(err, &decodeErr) || result.value != "" || calls != 1 {
@@ -270,7 +281,7 @@ func TestParallelInvalidResultDoesNotPanic(t *testing.T) {
 	c := testMultiClient(t, handler, handler)
 	var typedNil *string
 	for _, result := range []any{typedNil, "not a pointer"} {
-		if err := c.Call(result, "test_value"); err == nil {
+		if err := c.Call(result, "eth_call"); err == nil {
 			t.Fatalf("expected error for result %T", result)
 		}
 	}
@@ -313,8 +324,8 @@ func (a *mutableArgument) MarshalJSON() ([]byte, error) {
 }
 
 func TestParallelBroadcastSnapshotsArguments(t *testing.T) {
-	for _, batch := range []bool{false, true} {
-		t.Run(fmt.Sprintf("batch=%v", batch), func(t *testing.T) {
+	for _, parallel := range []bool{false, true} {
+		t.Run(fmt.Sprintf("parallel=%v", parallel), func(t *testing.T) {
 			ctx := testContext(t)
 			sent := make(chan string, 1)
 			c := testMultiClient(t,
@@ -324,6 +335,7 @@ func TestParallelBroadcastSnapshotsArguments(t *testing.T) {
 					return "ok", nil
 				},
 			)
+			c.parallelCalls = parallel
 			blocked := semaphore.NewWeighted(1)
 			if err := blocked.Acquire(ctx, 1); err != nil {
 				t.Fatal(err)
@@ -336,13 +348,7 @@ func TestParallelBroadcastSnapshotsArguments(t *testing.T) {
 			}()
 			c.allClients[1].rpcClient.sem = blocked
 			arg := &mutableArgument{value: "original"}
-			if batch {
-				var result string
-				b := []gethrpc.BatchElem{{Method: "eth_sendRawTransaction", Args: []any{arg}, Result: &result}}
-				if err := c.BatchCallContext(ctx, b); err != nil || b[0].Error != nil {
-					t.Fatalf("unexpected errors: %v %v", err, b[0].Error)
-				}
-			} else if err := c.CallContext(ctx, nil, "eth_sendRawTransaction", arg); err != nil {
+			if err := c.CallContext(ctx, nil, "eth_sendRawTransaction", arg); err != nil {
 				t.Fatal(err)
 			}
 			arg.value = "changed after return"

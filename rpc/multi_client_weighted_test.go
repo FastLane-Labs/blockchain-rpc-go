@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -92,8 +93,10 @@ func TestParallelBufferedFallbacksFollowWeights(t *testing.T) {
 			t.Run(fmt.Sprintf("batch=%v/timeouts=%d", batch, timeouts), func(t *testing.T) {
 				ctx := testContext(t)
 				var handlers []testHandler
+				var dispatches [3]atomic.Int32
 				for i := range 3 {
 					handlers = append(handlers, func(ctx context.Context, _ testRequest) (any, error) {
+						dispatches[i].Add(1)
 						if i < timeouts {
 							<-ctx.Done()
 							return nil, ctx.Err()
@@ -107,7 +110,7 @@ func TestParallelBufferedFallbacksFollowWeights(t *testing.T) {
 					})
 				}
 				c := testMultiClient(t, handlers...)
-				c.parallelCallTimeout = 100 * time.Millisecond
+				c.parallelCallTimeout = 500 * time.Millisecond
 				for i, weight := range []uint64{100, 50, 10} {
 					c.allClients[i].rpcClient.weight = weight
 				}
@@ -129,7 +132,10 @@ func TestParallelBufferedFallbacksFollowWeights(t *testing.T) {
 						}
 					}
 				}
-				for _, client := range c.allClients {
+				for i, client := range c.allClients {
+					if n := dispatches[i].Load(); n != 1 {
+						t.Fatalf("provider %d dispatched %d times", i, n)
+					}
 					waitUntil(t, ctx, func() bool { return client.rpcClient.queued.Load() == 0 })
 				}
 			})
@@ -215,7 +221,7 @@ func TestParallelPreferredQueueTimeout(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer preferred.sem.Release(1)
-			c.parallelCallTimeout = 50 * time.Millisecond
+			c.parallelCallTimeout = 500 * time.Millisecond
 			if got := callWeightedTest(ctx, c, batch); got.err != nil || got.value != "fallback" {
 				t.Fatalf("queue timeout did not allow fallback: %+v", got)
 			}

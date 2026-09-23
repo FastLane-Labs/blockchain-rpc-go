@@ -3,32 +3,32 @@ package rpc
 import (
 	"context"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"reflect"
-	"strings"
+
+	"github.com/ethereum/go-ethereum/rpc"
 )
 
-// Append into caller-provided storage so small pools do not allocate a candidate
-// slice. Snapshot health once: recounting it after launching calls could deadlock
-// the receiver if a health check changes a provider's status in between.
-func (c *MultiRpcClient) parallelClients(dst []*internalRpcClient, subscriptionRelated, broadcast bool) []*internalRpcClient {
-	for _, client := range c.allClients {
-		if client.rpcClient.sendOnly {
-			if broadcast {
-				dst = append(dst, client)
-			}
-			continue
-		}
-		if client.enabled.Load() && (!subscriptionRelated || client.rpcClient.SupportsSubscriptions()) {
-			dst = append(dst, client)
-		}
+// Unknown methods keep the original routing. In particular, node-local filters
+// and methods with side effects must not be duplicated across providers.
+func parallelReadMethod(method string) bool {
+	switch method {
+	case "eth_call", "eth_estimateGas", "eth_createAccessList", "debug_traceCall",
+		"eth_chainId", "eth_blockNumber", "eth_syncing", "eth_gasPrice", "eth_maxPriorityFeePerGas", "eth_feeHistory",
+		"eth_getBalance", "eth_getCode", "eth_getStorageAt", "eth_getProof", "eth_getTransactionCount",
+		"eth_getBlockByHash", "eth_getBlockByNumber", "eth_getBlockReceipts",
+		"eth_getBlockTransactionCountByHash", "eth_getBlockTransactionCountByNumber",
+		"eth_getUncleByBlockHashAndIndex", "eth_getUncleByBlockNumberAndIndex",
+		"eth_getUncleCountByBlockHash", "eth_getUncleCountByBlockNumber",
+		"eth_getTransactionByHash", "eth_getTransactionByBlockHashAndIndex", "eth_getTransactionByBlockNumberAndIndex",
+		"eth_getTransactionReceipt", "eth_getLogs", "net_version", "net_peerCount", "net_listening",
+		"rpc_modules", "web3_clientVersion", "web3_sha3":
+		return true
 	}
-	return dst
+	return false
 }
 
-// Encode arguments once, before returning ownership to the caller. Queued or
-// slow copies must not marshal caller-owned maps/slices after the race returns.
+// Encode arguments before returning ownership to the caller. Queued or slow
+// copies must not marshal caller-owned maps/slices after the call returns.
 func parallelArgs(args []any) ([]any, error) {
 	if len(args) == 0 {
 		return args, nil
@@ -37,7 +37,6 @@ func parallelArgs(args []any) ([]any, error) {
 	for i, arg := range args {
 		switch arg.(type) {
 		case nil, bool, string, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, uintptr, float32, float64:
-			// Plain scalar values cannot change after copying the interface.
 			encoded[i] = arg
 			continue
 		}
@@ -50,120 +49,71 @@ func parallelArgs(args []any) ([]any, error) {
 	return encoded, nil
 }
 
-type parallelResponse struct {
-	client *internalRpcClient
-	raw    json.RawMessage
-	value  reflect.Value // Private decoded result for a transaction broadcast.
-	err    error
-}
-
-func (c *MultiRpcClient) callContextConcurrent(ctx context.Context, result any, method string, args ...any) error {
-	var storage [8]*internalRpcClient
-	broadcast := method == "eth_sendRawTransaction"
-	clients := c.parallelClients(storage[:0], strings.HasSuffix(method, subscribeMethodSuffix), broadcast)
-	if len(clients) == 0 {
-		return ErrNoAvailableClients
-	}
-	if len(clients) == 1 {
-		// No extra copying, serialization, goroutine or channel is needed.
-		if !broadcast {
-			var cancel context.CancelFunc
-			ctx, cancel = context.WithDeadline(ctx, c.parallelDeadline())
-			defer cancel()
-		}
-		return clients[0].rpcClient.CallContext(ctx, result, method, args...)
-	}
-	var resultType reflect.Type
+func validateParallelResult(result any) error {
 	if result != nil {
 		v := reflect.ValueOf(result)
 		if v.Kind() != reflect.Pointer || v.IsNil() {
 			return &json.InvalidUnmarshalError{Type: v.Type()}
 		}
-		resultType = v.Type().Elem()
+	}
+	return nil
+}
+
+func (c *MultiRpcClient) callContextConcurrent(ctx context.Context, result any, method string, args ...any) error {
+	if err := validateParallelResult(result); err != nil {
+		return err
 	}
 	encodedArgs, err := parallelArgs(args)
 	if err != nil {
 		return err
 	}
-	requestCtx := ctx
-	if !broadcast {
-		var cancel context.CancelFunc
-		requestCtx, cancel = context.WithCancel(ctx)
-		defer cancel()
-	}
-	groups := groupParallelClients[parallelResponse](clients, !broadcast)
-	done := requestCtx.Done()
 	needsResult := result != nil
-	deadline := c.parallelDeadline()
-	for _, group := range groups {
-		for _, client := range group.clients {
-			go func(ctx context.Context) {
-				if !broadcast {
-					var cancel context.CancelFunc
-					ctx, cancel = context.WithDeadline(ctx, deadline)
-					defer cancel()
-				}
-				res := parallelResponse{client: client}
-				if res.err = ctx.Err(); res.err == nil {
-					if broadcast && needsResult {
-						// Match the default broadcast: a response succeeds only if
-						// it decodes, and failed/late decoders cannot touch result.
-						res.value = reflect.New(resultType)
-						res.err = client.rpcClient.CallContext(ctx, res.value.Interface(), method, encodedArgs...)
-					} else if needsResult {
-						res.err = client.rpcClient.CallContext(ctx, &res.raw, method, encodedArgs...)
-					} else {
-						res.err = client.rpcClient.CallContext(ctx, nil, method, encodedArgs...)
-					}
-				}
-				if !broadcast {
-					res.err = parallelAttemptError(ctx, res.err)
-				}
-				group.responses <- res
-			}(requestCtx)
+	raw, err := parallelCall(ctx, c, method, func(ctx context.Context, client *RpcClient) (json.RawMessage, error) {
+		var raw json.RawMessage
+		var receiver any
+		if needsResult {
+			receiver = &raw
 		}
+		err := client.CallContext(ctx, receiver, method, encodedArgs...)
+		return raw, err
+	})
+	if err != nil || !needsResult {
+		return err
 	}
-	var failures []parallelResponse
-	for _, group := range groups {
-		for range group.clients {
-			select {
-			case res := <-group.responses:
-				if err := requestCtx.Err(); err != nil {
-					return parallelErrors(method, failures, err)
-				}
-				// Broadcasts keep the default first-success semantics: a provider
-				// rejecting a transaction must not hide another provider's acceptance.
-				if res.err != nil && (broadcast || isParallelTimeout(res.err)) {
-					failures = append(failures, parallelResponse{client: res.client, err: res.err})
-					continue
-				}
-				if res.err != nil || !needsResult {
-					return res.err
-				}
-				if broadcast {
-					reflect.ValueOf(result).Elem().Set(res.value.Elem())
-					return nil
-				}
-				// Decode only the chosen response, on the caller's goroutine.
-				return json.Unmarshal(res.raw, result)
-			case <-done:
-				return parallelErrors(method, failures, requestCtx.Err())
+	// The driver has already cancelled losing copies. Only the caller decodes.
+	return json.Unmarshal(raw, result)
+}
+
+func (c *MultiRpcClient) batchCallContextParallel(ctx context.Context, b []rpc.BatchElem) error {
+	if len(b) == 0 {
+		return nil
+	}
+	// Workers only access this immutable snapshot, never the caller's batch.
+	template := make([]rpc.BatchElem, len(b))
+	for i, elem := range b {
+		args, err := parallelArgs(elem.Args)
+		if err != nil {
+			return err
+		}
+		template[i] = rpc.BatchElem{Method: elem.Method, Args: args}
+	}
+	selected, err := parallelCall(ctx, c, "batch", func(ctx context.Context, client *RpcClient) ([]rpc.BatchElem, error) {
+		batch := append([]rpc.BatchElem(nil), template...)
+		raw := make([]json.RawMessage, len(batch))
+		for i := range batch {
+			batch[i].Result = &raw[i]
+		}
+		err := client.BatchCallContext(ctx, batch)
+		return batch, err
+	})
+	for i := range b {
+		b[i].Error = err
+		if err == nil {
+			b[i].Error = selected[i].Error
+			if b[i].Error == nil {
+				b[i].Error = json.Unmarshal(*selected[i].Result.(*json.RawMessage), b[i].Result)
 			}
 		}
 	}
-	return parallelErrors(method, failures, nil)
-}
-
-// Format exhausted failures: every copy timed out, or every provider rejected
-// a broadcast. Accepted answers are returned unchanged, preserving their public
-// interfaces and error data.
-func parallelErrors(method string, failures []parallelResponse, cause error) error {
-	errs := make([]error, 0, len(failures)+1)
-	for _, res := range failures {
-		errs = append(errs, fmt.Errorf("%s: %w", res.client.rpcClient.id, res.err))
-	}
-	if cause != nil {
-		errs = append(errs, cause)
-	}
-	return fmt.Errorf("RPC %s failed: %w", method, errors.Join(errs...))
+	return err
 }

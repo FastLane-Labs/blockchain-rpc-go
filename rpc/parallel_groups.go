@@ -10,16 +10,12 @@ type parallelGroup[T any] struct {
 }
 
 // clients is a snapshot of allClients, which is already sorted by weight.
-// Broadcasts use one group so their selection does not depend on weights.
-func groupParallelClients[T any](clients []*internalRpcClient, weighted bool) []parallelGroup[T] {
+func groupParallelClients[T any](clients []*internalRpcClient) []parallelGroup[T] {
 	groups := make([]parallelGroup[T], 0, 1)
 	for start := 0; start < len(clients); {
-		end := len(clients)
-		if weighted {
-			end = start + 1
-			for end < len(clients) && clients[end].rpcClient.weight == clients[start].rpcClient.weight {
-				end++
-			}
+		end := start + 1
+		for end < len(clients) && clients[end].rpcClient.weight == clients[start].rpcClient.weight {
+			end++
 		}
 		groups = append(groups, parallelGroup[T]{
 			clients:   clients[start:end],

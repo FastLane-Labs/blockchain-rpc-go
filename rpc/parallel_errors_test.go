@@ -307,48 +307,6 @@ func TestParallelBroadcastWaitsForSuccess(t *testing.T) {
 	}
 }
 
-// A batch containing a transaction still selects the first RPC outcome. Its
-// losing copies must not be canceled.
-func TestParallelBroadcastBatchContinuesAfterRPCError(t *testing.T) {
-	ctx := testContext(t)
-	started, release := make(chan struct{}), make(chan struct{})
-	defer close(release)
-	finished := make(chan error, 1)
-	c := testMultiClient(t,
-		func(context.Context, testRequest) (any, error) { <-started; return nil, revertError{} },
-		func(context.Context, testRequest) (any, error) { return nil, nil },
-	)
-	c.parallelCallTimeout = time.Nanosecond
-	c.allClients[1].rpcClient.weight = 100 // Mixed batches still select by arrival.
-	setTestTransport(t, c, 1, transportFunc(func(r *http.Request) (*http.Response, error) {
-		close(started)
-		select {
-		case <-release:
-		case <-r.Context().Done():
-		}
-		finished <- r.Context().Err()
-		return nil, io.EOF
-	}))
-	var result string
-	b := []gethrpc.BatchElem{{Method: "eth_sendRawTransaction", Result: &result}}
-	if err := c.BatchCallContext(ctx, b); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := b[0].Error.(gethrpc.Error); !ok {
-		t.Fatalf("expected first RPC error, got %v", b[0].Error)
-	}
-	select {
-	case release <- struct{}{}:
-	case err := <-finished:
-		t.Fatalf("broadcast canceled before release: %v", err)
-	case <-ctx.Done():
-		t.Fatal(ctx.Err())
-	}
-	if err := receive(t, ctx, finished); err != nil {
-		t.Fatalf("losing broadcast was canceled: %v", err)
-	}
-}
-
 func TestParallelNullIsAnAcceptedResult(t *testing.T) {
 	started := make(chan struct{})
 	c := testMultiClient(t,
@@ -370,7 +328,7 @@ func TestParallelBatchAcceptsElementOutcomes(t *testing.T) {
 	c := testMultiClient(t,
 		func(context.Context, testRequest) (any, error) { return nil, nil },
 		func(ctx context.Context, req testRequest) (any, error) {
-			if req.Method == "test_null" {
+			if req.Method == "eth_call" {
 				close(started)
 				<-ctx.Done()
 				close(canceled)
@@ -404,11 +362,11 @@ func TestParallelBatchAcceptsElementOutcomes(t *testing.T) {
 	var null json.RawMessage
 	noResult, missing, reverted, success := "kept", "kept", "kept", ""
 	b := []gethrpc.BatchElem{
-		{Method: "test_null", Result: &null},
-		{Method: "test_no_result", Result: &noResult},
-		{Method: "test_missing", Result: &missing},
-		{Method: "test_reverted", Result: &reverted},
-		{Method: "test_success", Result: &success},
+		{Method: "eth_call", Result: &null},
+		{Method: "eth_getBalance", Result: &noResult},
+		{Method: "eth_getCode", Result: &missing},
+		{Method: "eth_estimateGas", Result: &reverted},
+		{Method: "eth_blockNumber", Result: &success},
 	}
 	ctx := testContext(t)
 	if err := c.BatchCallContext(ctx, b); err != nil {

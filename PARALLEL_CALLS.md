@@ -12,16 +12,31 @@ client, err := eth.DialMultiContextWithOptions(ctx, cfg,
     })
 ```
 
-Zero-valued options preserve the default behavior.
+Zero-valued options preserve default provider selection. The existing transaction
+broadcast implementation is shared by both modes, with argument snapshots,
+receiver validation, and error-cause preservation applied consistently.
+
+## Covered methods
+
+Parallel dispatch applies only to the read/simulation allowlist in
+`rpc/multi_client_calls.go`: standard Ethereum block, transaction, receipt, log,
+state and fee reads; `eth_call`, `eth_estimateGas`, `eth_createAccessList`,
+`debug_traceCall`; and the listed `net_*`, `web3_*` and `rpc_modules` reads.
+Unknown methods, node-local filters and raw subscriptions retain original routing.
+A batch is parallel only when **every** element is allowlisted. A mixed batch,
+including any `eth_sendRawTransaction` element, keeps the original single-provider
+selection and sequential retry behavior. It is never concurrently broadcast.
+Subscription and notification APIs are unchanged.
 
 ## Response selection
 
-- Start attempts on all healthy, capable providers concurrently. Use the existing
+- Start attempts on all healthy read providers concurrently. Use the existing
   configured weights: prefer the highest weight, advancing to lower weights only
   after every attempt at a higher weight times out. Equal-weight providers race
   each other; the first non-timeout response at that weight wins. HTTP preference
-  does not restrict this mode. Existing health checks and per-provider
-  rate/concurrency limits still apply.
+  does not restrict parallel reads. Existing health checks and per-provider
+  rate/concurrency limits still apply; queueing does not reduce a provider's
+  priority. Send-only providers are excluded from reads and batches.
 - Return the selected provider's result or error unchanged. Every
   JSON-RPC error, including reverts, is accepted unchanged; RPC codes and
   messages never affect selection. Direct `rpc.Error` / `rpc.DataError`
@@ -37,22 +52,21 @@ Zero-valued options preserve the default behavior.
 - Read batches select one provider's complete response using the same weight
   ordering, then decode its elements once. Element errors stay in
   `BatchElem.Error`; results from different providers are never combined.
-- Cancel ordinary losing copies, including queued copies that may never reach
-  their provider. `eth_sendRawTransaction` copies and batches containing one
-  continue under the caller's context. Single transaction calls include send-only
-  providers; batches use read-capable providers.
+- Cancel losing read copies as soon as a response is selected, before decoding,
+  including queued copies that may never reach their provider.
 - Keep the default broadcast semantics for `eth_sendRawTransaction` calls: return
   the first success, and only fail once every provider has failed, aggregating
   their errors with provider IDs. A fast `already known` or `nonce too low`
   rejection or malformed transaction hash never hides a later acceptance.
-  Batches containing a transaction still select the first non-timeout batch,
-  regardless of weights. Both broadcast paths use only the caller's deadline.
+  Include send-only providers and let all copies continue under the caller's
+  context. Broadcasts ignore weights and `ParallelCallTimeout`. A successfully
+  decoded acceptance is returned even if the caller has just canceled; cancellation
+  cannot undo a transaction already accepted by a provider.
 - Aggregate all timeouts with provider IDs when no provider answers.
   `errors.Is` / `errors.As` preserve their causes. Caller cancellation/deadline
-  stops waiting promptly, with errors collected so far. With one eligible
-  provider, apply its attempt timeout, delegate directly and return its error
-  unchanged.
-- Subscription and notification APIs retain their existing behavior.
+  stops waiting for reads promptly, with errors collected so far. The same driver,
+  receiver validation, argument snapshot and timeout normalization apply with one
+  or many eligible providers. Nil contexts are treated as `context.Background()`.
 
 Mutable arguments are encoded before starting workers. Workers never write to
 caller-owned results. Ordinary calls and batches decode only the chosen response,
@@ -61,12 +75,10 @@ another provider, preserving normal JSON decoder behavior for initialized
 receivers, maps, and custom codecs.
 Valid JSON `null` is accepted; later method-specific checks in `eth` are unchanged.
 
-Like the default transaction broadcast, multi-provider `eth_sendRawTransaction`
-calls decode each response into a private, zero-valued receiver of the caller's
-result type. A decode failure counts as that provider's failure; only a successfully
+Single `eth_sendRawTransaction` calls in either mode decode every response into a
+private, zero-valued receiver of the caller's result type. A decode failure counts as that provider's failure; only a successfully
 decoded result is copied to the caller. Custom broadcast decoders must work on
-zero-valued receivers and may run concurrently. Batches containing transactions
-continue to select a whole batch before decoding its elements.
+zero-valued receivers and may run concurrently, even after the call returns.
 
 ## Deadlines
 
@@ -83,27 +95,42 @@ while preserving a lower-weight response that completed earlier. With weights
 the call still waits for weight 100. If that attempt times out at 2 seconds,
 weight 50's buffered response is selected.
 
-Caller cancellation or deadline expiry always ends the entire operation, even
+For parallel reads, caller cancellation or deadline expiry ends selection, even
 when a fallback response is buffered. Give the caller more time than the attempt
 timeout to permit fallback after an attempt expires. A shorter caller deadline
-caps every attempt. Transaction broadcasts and batches containing transactions
-are exempt from `ParallelCallTimeout` and keep using the caller's context.
+caps every attempt. The cap applies even with one eligible provider and to calls
+made through `Call()` or `SupportedModules()` using a background context. Long
+reads may require a larger cap or a client without parallel reads enabled; the
+option is per client, not per call. Methods outside the allowlist and mixed
+batches use the caller's context without this cap.
 
 ## Latency and resource use
 
-One eligible provider adds a deadline context but no goroutine, channel, or
-argument copying. Multiple providers use one worker per provider and a buffered
-response channel per weight group. Broadcasts use one response channel. There is
-no new explicit mutex, wait group, or wait for losing workers. Error aggregation happens
-only on failure. The existing transports, metrics, limiters, and cancellation
-still use synchronization.
+Parallel reads use one worker per eligible provider and one buffered response
+channel per weight group, including a group of one for a single provider. The
+caller does not wait for losing read workers. Transaction broadcasting retains
+its existing workers, response channel and wait group.
 
-With N eligible providers, each logical call can make N provider requests.
+With N eligible providers, each covered logical call can make N provider requests.
 Fan-out adds scheduling, serialization, traffic, and quota consumption. A fast
 lower-weight provider does not reduce latency while a higher-weight attempt is
-pending. Cancellation releases local resources but cannot undo remote work or
-restore consumed rate-limit tokens. Provider
-metrics count individual copies, including canceled copies as errors.
+pending: the benefit is a buffered answer after a timeout. Limiter queueing counts
+against each attempt's cap. A saturated high-weight provider can delay selection;
+if every provider rejects its wait, the operation fails rather than queueing for
+the caller's entire budget. Non-timeout transport errors are returned without
+retry or provider demotion, unlike default selection.
+
+Cancellation releases local resources but cannot undo remote work or restore
+consumed rate-limit tokens. Canceling HTTP/1.1 requests can close their keep-alive
+connections, adding TCP/TLS handshakes on later calls; HTTP/2 can cancel individual
+streams. Immediate fan-out intentionally retains this cost. Check provider quotas,
+connection reuse and subscription traffic before enabling on a shared client.
+
+Provider call counters count actual copies, not logical operations. Errors and
+latency samples caused by coordinator cancellation after selection are excluded.
+Caller cancellation, attempt expiry and real provider failures retain existing
+metric handling; batch error counters count element errors. Logical-call latency,
+fallback frequency and selected weight need instrumentation in the consuming app.
 
 Run the concurrent latency benchmark with `-cpu=4` to compare four application
 callers, with metrics enabled and zero or 1 ms simulated provider delay:

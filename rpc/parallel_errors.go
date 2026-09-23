@@ -5,8 +5,29 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 )
+
+// Newer HTTP transports return the cancellation cause instead of ctx.Err().
+var errParallelSuperseded = fmt.Errorf("parallel RPC response selected: %w", context.Canceled)
+
+func isParallelCancellation(ctx context.Context, err error) bool {
+	return errors.Is(err, context.Canceled) && ctx != nil && context.Cause(ctx) == errParallelSuperseded
+}
+
+// Preserve the original broadcast error text while exposing provider causes.
+type providerErrors []error
+
+func (errs providerErrors) Error() string {
+	messages := make([]string, len(errs))
+	for i, err := range errs {
+		messages[i] = err.Error()
+	}
+	return strings.Join(messages, "; ")
+}
+
+func (errs providerErrors) Unwrap() []error { return errs }
 
 // Socket deadlines can fire before the context timer runs. Normalize their
 // errors at the end of the attempt, while its deadline is still available.

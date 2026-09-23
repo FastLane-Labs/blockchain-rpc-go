@@ -70,7 +70,7 @@ func TestParallelWebsocketReconnectTimeout(t *testing.T) {
 			c.allClients[0].rpcClient.c = ws
 			c.allClients[0].rpcClient.weight = 100
 			c.allClients[1].rpcClient.weight = 10
-			c.parallelCallTimeout = 250 * time.Millisecond
+			c.parallelCallTimeout = 500 * time.Millisecond
 			got := callWeightedTest(ctx, c, batch)
 			select {
 			case <-reconnecting:
