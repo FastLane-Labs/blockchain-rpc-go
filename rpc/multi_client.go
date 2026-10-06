@@ -221,11 +221,13 @@ func (c *MultiRpcClient) BatchCallContext(ctx context.Context, b []rpc.BatchElem
 		ctx = context.Background()
 	}
 	var subscriptionRelated bool
-	parallel := c.parallelCalls
+	parallel := c.parallelCalls && len(b) > 0
 
 	for _, elem := range b {
 		if strings.HasSuffix(elem.Method, subscribeMethodSuffix) {
 			subscriptionRelated = true
+			parallel = false
+			break
 		}
 		parallel = parallel && parallelReadMethod(elem.Method)
 	}
@@ -449,12 +451,6 @@ func (c *MultiRpcClient) SetHeader(key string, value string) {
 }
 
 func (c *MultiRpcClient) SupportedModules() (map[string]string, error) {
-	if c.parallelCalls {
-		var modules map[string]string
-		err := c.Call(&modules, "rpc_modules")
-		return modules, err
-	}
-
 	// Simply aggregates all results, not reliable
 	supportedModules := make(map[string]string)
 

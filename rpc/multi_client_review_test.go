@@ -125,15 +125,16 @@ func TestParallelBatchCancellation(t *testing.T) {
 				},
 			)
 			c.parallelCallTimeout = time.Hour
-			var result string
-			b := []gethrpc.BatchElem{{Method: "eth_call", Result: &result}}
+			result := "unchanged"
+			previousErr := errors.New("previous element error")
+			b := []gethrpc.BatchElem{{Method: "eth_call", Result: &result, Error: previousErr}}
 			err := c.BatchCallContext(ctx, b)
 			if success {
 				if err != nil || b[0].Error != nil || result != "winner" {
 					t.Fatalf("unexpected result: %q, errors: %v %v", result, err, b[0].Error)
 				}
-			} else if !errors.Is(err, context.Canceled) || !errors.Is(b[0].Error, context.Canceled) {
-				t.Fatalf("cancellation missing from batch/element errors: %v %v", err, b[0].Error)
+			} else if !errors.Is(err, context.Canceled) || b[0].Error != previousErr || result != "unchanged" {
+				t.Fatalf("cancellation must leave batch elements unchanged: %v %+v", err, b[0])
 			}
 			observed, stop := context.WithTimeout(context.Background(), time.Second)
 			defer stop()
@@ -283,6 +284,22 @@ func TestParallelInvalidResultDoesNotPanic(t *testing.T) {
 	for _, result := range []any{typedNil, "not a pointer"} {
 		if err := c.Call(result, "eth_call"); err == nil {
 			t.Fatalf("expected error for result %T", result)
+		}
+	}
+}
+
+func TestTypedNilReadReceiverPreservesRPCError(t *testing.T) {
+	for _, parallel := range []bool{false, true} {
+		c := testMultiClient(t, func(context.Context, testRequest) (any, error) {
+			return nil, rpcOutcomeError{3, "execution reverted"}
+		})
+		c.parallelCalls = parallel
+		var result *string
+		err := c.Call(result, "eth_call")
+		coded, codeOK := err.(gethrpc.Error)
+		data, dataOK := err.(gethrpc.DataError)
+		if !codeOK || !dataOK || coded.ErrorCode() != 3 || data.ErrorData() != "0x12345678" {
+			t.Fatalf("parallel=%v: typed-nil receiver hid RPC error: %v", parallel, err)
 		}
 	}
 }

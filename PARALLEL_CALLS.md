@@ -23,10 +23,14 @@ Parallel dispatch applies only to the read/simulation allowlist in
 state and fee reads; `eth_call`, `eth_estimateGas`, `eth_createAccessList`,
 `debug_traceCall`; and the listed `net_*`, `web3_*` and `rpc_modules` reads.
 Unknown methods, node-local filters and raw subscriptions retain original routing.
-A batch is parallel only when **every** element is allowlisted. A mixed batch,
+A nonempty batch is parallel only when **every** element is allowlisted. A mixed batch,
 including any `eth_sendRawTransaction` element, keeps the original single-provider
 selection and sequential retry behavior. It is never concurrently broadcast.
 Subscription and notification APIs are unchanged.
+
+`SupportedModules()` retains its original aggregation across providers and fails
+if any provider fails. It does not use parallel dispatch or its attempt timeout;
+direct `Call` requests for `rpc_modules` do.
 
 ## Response selection
 
@@ -46,12 +50,14 @@ Subscription and notification APIs are unchanged.
   ("context deadline exceeded"), or whose local rate-limit wait would exceed the
   deadline, waits for another copy. A network timeout returned at or after the
   attempt's deadline also qualifies, including WebSocket handshake I/O timeouts.
+  Errors wrapping an expired context's custom deadline cause also qualify.
   These errors retain their transport cause and match `context.DeadlineExceeded`
   through `errors.Is`. Earlier network timeouts and RPC errors saying "request
   timed out" remain answers; error text alone never enables fallback.
 - Read batches select one provider's complete response using the same weight
   ordering, then decode its elements once. Element errors stay in
   `BatchElem.Error`; results from different providers are never combined.
+  Batch-level errors are returned without modifying element errors or results.
 - Cancel losing read copies as soon as a response is selected, before decoding,
   including queued copies that may never reach their provider.
 - Keep the default broadcast semantics for `eth_sendRawTransaction` calls: return
@@ -63,8 +69,10 @@ Subscription and notification APIs are unchanged.
   decoded acceptance is returned even if the caller has just canceled; cancellation
   cannot undo a transaction already accepted by a provider.
 - Aggregate all timeouts with provider IDs when no provider answers.
-  `errors.Is` / `errors.As` preserve their causes. Caller cancellation/deadline
-  stops waiting for reads promptly, with errors collected so far. The same driver,
+  `errors.Is` / `errors.As` preserve their causes. Caller deadline expiry selects
+  the highest-weight buffered non-timeout response, or returns the deadline error
+  with errors collected so far. Explicit caller cancellation ends selection
+  immediately, even with buffered responses. The same driver,
   receiver validation, argument snapshot and timeout normalization apply with one
   or many eligible providers. Nil contexts are treated as `context.Background()`.
 
@@ -73,6 +81,8 @@ caller-owned results. Ordinary calls and batches decode only the chosen response
 on the calling goroutine. Their decode errors end selection without trying
 another provider, preserving normal JSON decoder behavior for initialized
 receivers, maps, and custom codecs.
+For read calls, a typed-nil receiver fails only when decoding a successful response;
+RPC errors are returned unchanged. Non-pointer receivers are rejected before dispatch.
 Valid JSON `null` is accepted; later method-specific checks in `eth` are unchanged.
 
 Single `eth_sendRawTransaction` calls in either mode decode every response into a
@@ -95,11 +105,12 @@ while preserving a lower-weight response that completed earlier. With weights
 the call still waits for weight 100. If that attempt times out at 2 seconds,
 weight 50's buffered response is selected.
 
-For parallel reads, caller cancellation or deadline expiry ends selection, even
-when a fallback response is buffered. Give the caller more time than the attempt
-timeout to permit fallback after an attempt expires. A shorter caller deadline
-caps every attempt. The cap applies even with one eligible provider and to calls
-made through `Call()` or `SupportedModules()` using a background context. Long
+For parallel reads, caller deadline expiry stops waiting and selects the
+highest-weight non-timeout response already buffered. If none is available, the
+deadline error is returned. Explicit caller cancellation ends selection even
+when a fallback response is buffered. A shorter caller deadline caps every
+attempt. The attempt cap applies even with one eligible provider and to calls
+made through `Call()` using a background context. Long
 reads may require a larger cap or a client without parallel reads enabled; the
 option is per client, not per call. Methods outside the allowlist and mixed
 batches use the caller's context without this cap.

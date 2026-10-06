@@ -37,6 +37,10 @@ func parallelAttemptError(ctx context.Context, err error) error {
 	if err == nil || errors.Is(err, context.DeadlineExceeded) {
 		return err
 	}
+	// HTTP transports can return a custom deadline cause instead of ctx.Err().
+	if ctx.Err() == context.DeadlineExceeded && errors.Is(err, context.Cause(ctx)) {
+		return fmt.Errorf("%w: %w", context.DeadlineExceeded, err)
+	}
 	var timeoutErr net.Error
 	if !errors.As(err, &timeoutErr) || !timeoutErr.Timeout() {
 		return err

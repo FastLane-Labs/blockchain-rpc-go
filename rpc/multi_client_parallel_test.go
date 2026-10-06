@@ -352,10 +352,10 @@ func TestParallelBatchTimeouts(t *testing.T) {
 				}
 				return
 			}
+			if b[0].Error != nil || result != "" {
+				t.Fatalf("transport failure modified batch element: %+v", b[0])
+			}
 			for _, id := range []string{"provider-0", "provider-1"} {
-				if b[0].Error == nil || !strings.Contains(b[0].Error.Error(), id+": ") {
-					t.Fatalf("missing %s in %v", id, b[0].Error)
-				}
 				if !strings.Contains(err.Error(), id+": ") {
 					t.Fatalf("missing %s in timeout error %v", id, err)
 				}
@@ -371,34 +371,31 @@ func (failingTransport) RoundTrip(*http.Request) (*http.Response, error) {
 	return nil, context.DeadlineExceeded
 }
 
-func TestParallelSupportedModules(t *testing.T) {
-	ctx := testContext(t)
-	started := make(chan struct{}, 2)
-	release := make(chan struct{})
-	defer close(release)
-	handler := func(_ context.Context, req testRequest) (any, error) {
-		if req.Method != "rpc_modules" {
-			t.Errorf("unexpected method: %s", req.Method)
+func TestSupportedModulesPreservesAggregation(t *testing.T) {
+	for _, parallel := range []bool{false, true} {
+		for _, fail := range []bool{false, true} {
+			t.Run(fmt.Sprintf("parallel=%v/fail=%v", parallel, fail), func(t *testing.T) {
+				c := testMultiClient(t,
+					func(context.Context, testRequest) (any, error) { return map[string]string{"eth": "1.0"}, nil },
+					func(context.Context, testRequest) (any, error) {
+						if fail {
+							return nil, errors.New("module lookup failed")
+						}
+						return map[string]string{"debug": "1.0"}, nil
+					},
+				)
+				c.parallelCalls = parallel
+				c.allClients[0].rpcClient.weight = 100
+				modules, err := c.SupportedModules()
+				if fail {
+					if err == nil || modules != nil {
+						t.Fatalf("provider failure hidden: modules=%v err=%v", modules, err)
+					}
+				} else if err != nil || len(modules) != 2 || modules["eth"] != "1.0" || modules["debug"] != "1.0" {
+					t.Fatalf("module union lost: modules=%v err=%v", modules, err)
+				}
+			})
 		}
-		started <- struct{}{}
-		<-release
-		return map[string]string{"eth": "1.0"}, nil
-	}
-	c := testMultiClient(t, handler, handler)
-	returned := make(chan error, 1)
-	go func() {
-		modules, err := c.SupportedModules()
-		if err == nil && modules["eth"] != "1.0" {
-			err = fmt.Errorf("unexpected modules: %v", modules)
-		}
-		returned <- err
-	}()
-	for range 2 {
-		receive(t, ctx, started)
-	}
-	release <- struct{}{}
-	if err := receive(t, ctx, returned); err != nil {
-		t.Fatal(err)
 	}
 }
 

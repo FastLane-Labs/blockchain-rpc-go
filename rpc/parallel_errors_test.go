@@ -116,6 +116,52 @@ func TestParallelAttemptDeadlineErrors(t *testing.T) {
 	}
 }
 
+func TestParallelAttemptDeadlineCause(t *testing.T) {
+	cause := errors.New("network timeout")
+	expired, cancel := context.WithDeadlineCause(context.Background(), time.Now().Add(-time.Second), cause)
+	defer cancel()
+	active, stop := context.WithDeadlineCause(context.Background(), time.Now().Add(time.Hour), cause)
+	defer stop()
+	canceled, cancelCause := context.WithCancelCause(context.Background())
+	cancelCause(cause)
+	transportErr := &url.Error{Op: "Post", URL: "http://provider", Err: cause}
+	for _, tc := range []struct {
+		name    string
+		ctx     context.Context
+		err     error
+		timeout bool
+	}{
+		{"deadline cause", expired, cause, true},
+		{"HTTP deadline cause", expired, transportErr, true},
+		{"success after deadline", expired, nil, false},
+		{"unrelated error after deadline", expired, io.EOF, false},
+		{"matching text after deadline", expired, errors.New(cause.Error()), false},
+		{"RPC error after deadline", expired, rpcOutcomeError{-32000, cause.Error()}, false},
+		{"cause before deadline", active, transportErr, false},
+		{"explicit cancellation cause", canceled, transportErr, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parallelAttemptError(tc.ctx, tc.err)
+			if !tc.timeout {
+				if got != tc.err {
+					t.Fatalf("non-timeout response changed: got %v, want %v", got, tc.err)
+				}
+				return
+			}
+			if !isParallelTimeout(got) || !errors.Is(got, context.DeadlineExceeded) ||
+				!errors.Is(got, cause) || !errors.Is(got, tc.err) {
+				t.Fatalf("deadline classification or original cause lost: %v", got)
+			}
+			if tc.err == transportErr {
+				var original *url.Error
+				if !errors.As(got, &original) || original != transportErr {
+					t.Fatalf("original HTTP error lost: %v", got)
+				}
+			}
+		})
+	}
+}
+
 type transportFunc func(*http.Request) (*http.Response, error)
 
 func (f transportFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }

@@ -5,8 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"net"
 	"net/http"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -17,6 +23,50 @@ import (
 	dto "github.com/prometheus/client_model/go"
 	"golang.org/x/time/rate"
 )
+
+func TestParallelReadAllowlistCoversEthClient(t *testing.T) {
+	files, err := filepath.Glob("../eth/*.go")
+	if err != nil || len(files) == 0 {
+		t.Fatalf("find eth source files: %v", err)
+	}
+	for _, filename := range files {
+		if strings.HasSuffix(filename, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(token.NewFileSet(), filename, nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ast.Inspect(file, func(node ast.Node) bool {
+			literal, ok := node.(*ast.BasicLit)
+			if !ok || literal.Kind != token.STRING {
+				return true
+			}
+			method, _ := strconv.Unquote(literal.Value)
+			isMethod := strings.HasPrefix(method, "eth_") || strings.HasPrefix(method, "net_") ||
+				strings.HasPrefix(method, "web3_") || strings.HasPrefix(method, "debug_")
+			// Exempt writes/node-local methods here instead of allowlisting them.
+			if isMethod && method != "eth_sendRawTransaction" && !parallelReadMethod(method) {
+				t.Errorf("%s: %s is missing from the parallel read allowlist", filename, method)
+			}
+			return true
+		})
+	}
+}
+
+func TestEmptyBatchChecksProviderAvailability(t *testing.T) {
+	c := testMultiClient(t, func(context.Context, testRequest) (any, error) {
+		t.Error("unhealthy provider called")
+		return nil, nil
+	})
+	c.allClients[0].setEnabled(false)
+	for _, parallel := range []bool{false, true} {
+		c.parallelCalls = parallel
+		if err := c.BatchCall(nil); !errors.Is(err, ErrNoAvailableClients) {
+			t.Fatalf("parallel=%v: empty batch reported success without a provider: %v", parallel, err)
+		}
+	}
+}
 
 func TestParallelStatefulMethodsKeepOriginalRouting(t *testing.T) {
 	for _, method := range []string{"eth_newFilter", "eth_getFilterChanges", "eth_uninstallFilter", "custom_submitBundle", "eth_sendRawTransaction"} {
@@ -108,7 +158,11 @@ func TestParallelInvalidReceiverNeverDispatches(t *testing.T) {
 					}
 					c := testMultiClient(t, handlers...)
 					c.parallelCalls = parallel
-					for _, result := range []any{(*string)(nil), "not a pointer"} {
+					results := []any{"not a pointer"}
+					if method == "eth_sendRawTransaction" {
+						results = append(results, (*string)(nil))
+					}
+					for _, result := range results {
 						var invalid *json.InvalidUnmarshalError
 						if err := c.CallContext(testContext(t), result, method); !errors.As(err, &invalid) {
 							t.Fatalf("want invalid receiver error, got %v", err)

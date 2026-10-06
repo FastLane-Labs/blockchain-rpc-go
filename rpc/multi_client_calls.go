@@ -60,8 +60,8 @@ func validateParallelResult(result any) error {
 }
 
 func (c *MultiRpcClient) callContextConcurrent(ctx context.Context, result any, method string, args ...any) error {
-	if err := validateParallelResult(result); err != nil {
-		return err
+	if result != nil && reflect.TypeOf(result).Kind() != reflect.Pointer {
+		return &json.InvalidUnmarshalError{Type: reflect.TypeOf(result)}
 	}
 	encodedArgs, err := parallelArgs(args)
 	if err != nil {
@@ -85,9 +85,6 @@ func (c *MultiRpcClient) callContextConcurrent(ctx context.Context, result any, 
 }
 
 func (c *MultiRpcClient) batchCallContextParallel(ctx context.Context, b []rpc.BatchElem) error {
-	if len(b) == 0 {
-		return nil
-	}
 	// Workers only access this immutable snapshot, never the caller's batch.
 	template := make([]rpc.BatchElem, len(b))
 	for i, elem := range b {
@@ -106,14 +103,14 @@ func (c *MultiRpcClient) batchCallContextParallel(ctx context.Context, b []rpc.B
 		err := client.BatchCallContext(ctx, batch)
 		return batch, err
 	})
+	if err != nil {
+		return err
+	}
 	for i := range b {
-		b[i].Error = err
-		if err == nil {
-			b[i].Error = selected[i].Error
-			if b[i].Error == nil {
-				b[i].Error = json.Unmarshal(*selected[i].Result.(*json.RawMessage), b[i].Result)
-			}
+		b[i].Error = selected[i].Error
+		if b[i].Error == nil {
+			b[i].Error = json.Unmarshal(*selected[i].Result.(*json.RawMessage), b[i].Result)
 		}
 	}
-	return err
+	return nil
 }

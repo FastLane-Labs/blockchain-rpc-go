@@ -24,8 +24,9 @@ type MultiRpcClientOptions struct {
 	// ParallelCallTimeout caps each parallel read attempt, including queueing,
 	// even with one eligible provider. Zero defaults to 2 seconds; negatives are
 	// invalid. Attempts share an absolute deadline and get no extra window on
-	// fallback. The caller's deadline takes precedence and should exceed this
-	// cap to leave time to select a buffered fallback. Ignored for other methods.
+	// fallback. The caller's earlier deadline stops waiting and selects the
+	// highest-weight buffered non-timeout response, if any. Explicit caller
+	// cancellation still ends selection immediately. Ignored for other methods.
 	ParallelCallTimeout time.Duration
 }
 

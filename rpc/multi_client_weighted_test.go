@@ -185,19 +185,88 @@ func TestParallelWaitsForEntireHigherWeightGroup(t *testing.T) {
 	}
 }
 
-func TestParallelCallerDeadlineDiscardsBufferedFallback(t *testing.T) {
+func TestParallelCallerDeadlineUsesBufferedFallback(t *testing.T) {
+	revert := rpcOutcomeError{3, "execution reverted"}
+	for _, batch := range []bool{false, true} {
+		for _, tc := range []struct {
+			name          string
+			second, third error
+			wantValue     string
+			wantErr       error
+			deadlineCause error
+		}{
+			{"highest buffered weight", nil, nil, "provider-1", nil, nil},
+			{"buffered error is final", revert, nil, "", revert, nil},
+			{"skip buffered timeout", context.DeadlineExceeded, nil, "provider-2", nil, nil},
+			{"no usable response", context.DeadlineExceeded, context.DeadlineExceeded, "", context.DeadlineExceeded, nil},
+			{"custom deadline cause", nil, nil, "provider-1", nil, errors.New("network timeout")},
+			{"custom deadline cause preserves buffered error", revert, nil, "", revert, errors.New("network timeout")},
+		} {
+			t.Run(fmt.Sprintf("batch=%v/%s", batch, tc.name), func(t *testing.T) {
+				handlers := []testHandler{
+					func(ctx context.Context, _ testRequest) (any, error) { <-ctx.Done(); return nil, ctx.Err() },
+				}
+				for i, err := range []error{tc.second, tc.third} {
+					handlers = append(handlers, func(context.Context, testRequest) (any, error) {
+						return fmt.Sprintf("provider-%d", i+1), err
+					})
+				}
+				c := testMultiClient(t, handlers...)
+				for i, weight := range []uint64{100, 50, 10} {
+					c.allClients[i].rpcClient.weight = weight
+				}
+				if tc.deadlineCause != nil {
+					setTestTransport(t, c, 0, transportFunc(func(r *http.Request) (*http.Response, error) {
+						<-r.Context().Done()
+						return nil, context.Cause(r.Context())
+					}))
+				}
+				for i, err := range []error{tc.second, tc.third} {
+					if errors.Is(err, context.DeadlineExceeded) {
+						setTestTransport(t, c, i+1, failingTransport{})
+					}
+				}
+				c.parallelCallTimeout = time.Second
+				ctx, cancel := context.WithTimeoutCause(testContext(t), 100*time.Millisecond, tc.deadlineCause)
+				defer cancel()
+				got := callWeightedTest(ctx, c, batch)
+				if ctx.Err() != context.DeadlineExceeded || got.value != tc.wantValue {
+					t.Fatalf("wrong deadline result: ctx=%v result=%+v", ctx.Err(), got)
+				}
+				if tc.wantErr == revert {
+					coded, ok := got.err.(gethrpc.Error)
+					data, dataOK := got.err.(gethrpc.DataError)
+					if !ok || !dataOK || coded.ErrorCode() != 3 || data.ErrorData() != "0x12345678" {
+						t.Fatalf("buffered RPC error/data lost: %v", got.err)
+					}
+				} else if !errors.Is(got.err, tc.wantErr) {
+					t.Fatalf("got error %v, want %v", got.err, tc.wantErr)
+				}
+			})
+		}
+	}
+}
+
+func TestParallelCallerCancellationDiscardsBufferedFallback(t *testing.T) {
 	for _, batch := range []bool{false, true} {
 		t.Run(fmt.Sprintf("batch=%v", batch), func(t *testing.T) {
+			answered := make(chan struct{})
 			c := testMultiClient(t,
 				func(ctx context.Context, _ testRequest) (any, error) { <-ctx.Done(); return nil, ctx.Err() },
-				func(context.Context, testRequest) (any, error) { return "buffered", nil },
+				func(context.Context, testRequest) (any, error) { close(answered); return "buffered", nil },
 			)
 			c.allClients[0].rpcClient.weight = 100
-			c.parallelCallTimeout = time.Second
-			ctx, cancel := context.WithTimeout(testContext(t), 100*time.Millisecond)
+			c.parallelCallTimeout = time.Hour
+			observed := testContext(t)
+			ctx, cancel := context.WithCancel(observed)
 			defer cancel()
-			if got := callWeightedTest(ctx, c, batch); !errors.Is(got.err, context.DeadlineExceeded) || got.value != "" {
-				t.Fatalf("caller deadline must end selection: %+v", got)
+			returned := make(chan weightedTestResult, 1)
+			go func() { returned <- callWeightedTest(ctx, c, batch) }()
+			receive(t, observed, answered)
+			waitUntil(t, observed, func() bool { return c.allClients[1].rpcClient.queued.Load() == 0 })
+			cancel()
+			if got := receive(t, observed, returned); !errors.Is(got.err, context.Canceled) || got.value != "" {
+				t.Fatalf("explicit cancellation must discard buffered responses: %+v", got)
 			}
 		})
 	}

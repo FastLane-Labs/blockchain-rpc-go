@@ -39,23 +39,34 @@ func parallelCall[T any](ctx context.Context, c *MultiRpcClient, method string, 
 		}
 	}
 	var failures []error
+nextGroup:
 	for _, group := range groups {
 		for range group.clients {
+			var res parallelResponse[T]
 			select {
-			case res := <-group.responses:
-				if err := ctx.Err(); err != nil {
-					return zero, parallelErrors(method, failures, err)
-				}
-				if !isParallelTimeout(res.err) {
-					return res.value, res.err
-				}
-				failures = append(failures, fmt.Errorf("%s: %w", res.client.rpcClient.id, res.err))
+			case res = <-group.responses:
 			case <-ctx.Done():
-				return zero, parallelErrors(method, failures, ctx.Err())
+				if ctx.Err() != context.DeadlineExceeded {
+					return zero, parallelErrors(method, failures, ctx.Err())
+				}
+				// At the caller's deadline, consider only responses already
+				// buffered, preserving weight order without waiting for workers.
+				select {
+				case res = <-group.responses:
+				default:
+					continue nextGroup
+				}
 			}
+			if err := ctx.Err(); err != nil && err != context.DeadlineExceeded {
+				return zero, parallelErrors(method, failures, err)
+			}
+			if !isParallelTimeout(res.err) {
+				return res.value, res.err
+			}
+			failures = append(failures, fmt.Errorf("%s: %w", res.client.rpcClient.id, res.err))
 		}
 	}
-	return zero, parallelErrors(method, failures, nil)
+	return zero, parallelErrors(method, failures, ctx.Err())
 }
 
 func parallelErrors(method string, failures []error, cause error) error {
