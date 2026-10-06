@@ -297,8 +297,11 @@ func TestRateLimitDeadlineBoundaryAlwaysClassified(t *testing.T) {
 
 func TestParallelCancellationMetrics(t *testing.T) {
 	for _, batch := range []bool{false, true} {
-		for _, callerCancel := range []bool{false, true} {
-			t.Run(fmt.Sprintf("batch=%v/callerCancel=%v", batch, callerCancel), func(t *testing.T) {
+		for _, tc := range []struct{ callerCancel, closedConnection bool }{
+			{false, false}, {true, false}, {false, true}, {true, true},
+		} {
+			callerCancel := tc.callerCancel
+			t.Run(fmt.Sprintf("batch=%v/callerCancel=%v/closedConnection=%v", batch, callerCancel, tc.closedConnection), func(t *testing.T) {
 				ctx, cancel := context.WithCancel(testContext(t))
 				defer cancel()
 				started := make(chan struct{})
@@ -316,6 +319,13 @@ func TestParallelCancellationMetrics(t *testing.T) {
 						return "winner", nil
 					},
 				)
+				if tc.closedConnection {
+					setTestTransport(t, c, 0, transportFunc(func(r *http.Request) (*http.Response, error) {
+						close(started)
+						<-r.Context().Done()
+						return nil, &net.OpError{Op: "read", Net: "tcp", Err: net.ErrClosed}
+					}))
+				}
 				c.parallelCallTimeout = time.Hour
 				loser := c.allClients[0].rpcClient
 				loser.metrics = newMetrics(prometheus.NewRegistry())

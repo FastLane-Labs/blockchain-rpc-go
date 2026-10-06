@@ -13,7 +13,9 @@ import (
 var errParallelSuperseded = fmt.Errorf("parallel RPC response selected: %w", context.Canceled)
 
 func isParallelCancellation(ctx context.Context, err error) bool {
-	return errors.Is(err, context.Canceled) && ctx != nil && context.Cause(ctx) == errParallelSuperseded
+	// Canceling an in-flight HTTP read can also surface as a closed connection.
+	return ctx != nil && context.Cause(ctx) == errParallelSuperseded &&
+		(errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed))
 }
 
 // Preserve the original broadcast error text while exposing provider causes.
