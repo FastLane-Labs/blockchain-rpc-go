@@ -15,6 +15,12 @@ var (
 	ErrMaxConcurrencyExceeded = errors.New("max concurrency exceeded")
 )
 
+// The limiter rejects a wait that would exceed the deadline before the context
+// expires. Parallel calls treat its untyped error as that copy's timeout.
+type rateLimitWaitError struct{ error }
+
+func (e rateLimitWaitError) Unwrap() error { return e.error }
+
 // Returns whether current rate limits allow a request to be made now.
 func (c *RpcClient) canMakeRequestNow() bool {
 	if c.lim != nil && c.lim.Tokens() < 1 {
@@ -41,10 +47,12 @@ func (c *RpcClient) applyRateLimit(ctx context.Context, nonBlocking bool) (done 
 	c.queued.Add(1)
 
 	if err := c.advanceLimiter(ctx, nonBlocking); err != nil {
+		c.queued.Add(^uint64(0))
 		return nil, err
 	}
 
 	if err := c.acquireSemaphore(ctx, defaultSemaphoreWeight, nonBlocking); err != nil {
+		c.queued.Add(^uint64(0))
 		return nil, err
 	}
 
@@ -68,6 +76,9 @@ func (c *RpcClient) advanceLimiter(ctx context.Context, nonBlocking bool) error 
 	}
 
 	if err := c.lim.Wait(ctx); err != nil {
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			return rateLimitWaitError{err}
+		}
 		return err
 	}
 

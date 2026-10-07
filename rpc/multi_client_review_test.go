@@ -1,0 +1,387 @@
+package rpc
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"testing"
+	"time"
+
+	gethrpc "github.com/ethereum/go-ethereum/rpc"
+	"golang.org/x/sync/semaphore"
+	"golang.org/x/time/rate"
+)
+
+// These deliberately use the original positional literal and function types.
+// Adding config fields or making existing constructors variadic breaks clients.
+var (
+	_                                                                       = MultiRpcClientConfig{nil, false, 0, 0, nil}
+	_ func(*MultiRpcClientConfig) (*MultiRpcClient, error)                  = DialMulti
+	_ func(context.Context, *MultiRpcClientConfig) (*MultiRpcClient, error) = DialMultiContext
+)
+
+func waitUntil(t *testing.T, ctx context.Context, condition func() bool) {
+	t.Helper()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for !condition() {
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			t.Fatal("condition did not become true before deadline")
+		}
+	}
+}
+
+func TestParallelCallCancelsLoser(t *testing.T) {
+	ctx, cancel := context.WithCancel(testContext(t))
+	defer cancel()
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	c := testMultiClient(t,
+		func(ctx context.Context, _ testRequest) (any, error) {
+			close(started)
+			<-ctx.Done()
+			close(canceled)
+			return nil, ctx.Err()
+		},
+		func(context.Context, testRequest) (any, error) {
+			<-started
+			return "winner", nil
+		},
+	)
+	c.parallelCallTimeout = time.Hour
+	c.allClients[0].rpcClient.sem = semaphore.NewWeighted(1)
+	var result string
+	if err := c.CallContext(ctx, &result, "eth_call"); err != nil {
+		t.Fatal(err)
+	}
+	observed, stop := context.WithTimeout(context.Background(), time.Second)
+	defer stop()
+	receive(t, observed, canceled)
+	waitUntil(t, observed, func() bool { return c.allClients[0].rpcClient.queued.Load() == 0 })
+	if !c.allClients[0].rpcClient.sem.TryAcquire(1) {
+		t.Fatal("losing call retained its concurrency slot")
+	}
+	c.allClients[0].rpcClient.sem.Release(1)
+}
+
+func TestParallelCallCancelsQueuedCopy(t *testing.T) {
+	ctx, cancel := context.WithCancel(testContext(t))
+	defer cancel()
+	allowWinner := make(chan struct{})
+	defer close(allowWinner)
+	c := testMultiClient(t,
+		func(context.Context, testRequest) (any, error) {
+			t.Error("queued copy should have been canceled before sending")
+			return "unexpected", nil
+		},
+		func(context.Context, testRequest) (any, error) {
+			<-allowWinner
+			return "winner", nil
+		},
+	)
+	c.parallelCallTimeout = time.Hour
+	slow := c.allClients[0].rpcClient
+	slow.sem = semaphore.NewWeighted(1)
+	if err := slow.sem.Acquire(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	defer slow.sem.Release(1)
+	returned := make(chan error, 1)
+	go func() { returned <- c.CallContext(ctx, nil, "eth_call") }()
+	waitUntil(t, ctx, func() bool { return slow.queued.Load() == 1 })
+	allowWinner <- struct{}{}
+	if err := receive(t, ctx, returned); err != nil {
+		t.Fatal(err)
+	}
+	observed, stop := context.WithTimeout(context.Background(), time.Second)
+	defer stop()
+	waitUntil(t, observed, func() bool { return slow.queued.Load() == 0 })
+}
+
+func TestParallelBatchCancellation(t *testing.T) {
+	for _, success := range []bool{false, true} {
+		t.Run(fmt.Sprintf("success=%v", success), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(testContext(t))
+			defer cancel()
+			started := make(chan struct{})
+			canceled := make(chan struct{})
+			c := testMultiClient(t,
+				func(ctx context.Context, _ testRequest) (any, error) {
+					close(started)
+					<-ctx.Done()
+					close(canceled)
+					return nil, ctx.Err()
+				},
+				func(context.Context, testRequest) (any, error) {
+					<-started
+					if !success {
+						cancel()
+						return nil, errors.New("failed")
+					}
+					return "winner", nil
+				},
+			)
+			c.parallelCallTimeout = time.Hour
+			result := "unchanged"
+			previousErr := errors.New("previous element error")
+			b := []gethrpc.BatchElem{{Method: "eth_call", Result: &result, Error: previousErr}}
+			err := c.BatchCallContext(ctx, b)
+			if success {
+				if err != nil || b[0].Error != nil || result != "winner" {
+					t.Fatalf("unexpected result: %q, errors: %v %v", result, err, b[0].Error)
+				}
+			} else if !errors.Is(err, context.Canceled) || b[0].Error != previousErr || result != "unchanged" {
+				t.Fatalf("cancellation must leave batch elements unchanged: %v %+v", err, b[0])
+			}
+			observed, stop := context.WithTimeout(context.Background(), time.Second)
+			defer stop()
+			receive(t, observed, canceled)
+		})
+	}
+}
+
+func TestRateLimitCancellationDoesNotLeakQueueCount(t *testing.T) {
+	for _, limited := range []string{"rate", "concurrency"} {
+		t.Run(limited, func(t *testing.T) {
+			c := &RpcClient{}
+			if limited == "rate" {
+				c.lim = rate.NewLimiter(1, 1)
+				c.lim.Allow()
+			} else {
+				c.sem = semaphore.NewWeighted(1)
+				if err := c.sem.Acquire(context.Background(), 1); err != nil {
+					t.Fatal(err)
+				}
+				defer c.sem.Release(1)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			if _, err := c.applyRateLimit(ctx, false); err == nil {
+				t.Fatal("expected cancellation")
+			}
+			if count := c.queued.Load(); count != 0 {
+				t.Fatalf("leaked %d queued requests", count)
+			}
+		})
+	}
+}
+
+func TestRateLimitWaitPreservesDefaultErrors(t *testing.T) {
+	c := &RpcClient{lim: rate.NewLimiter(1, 1)}
+	c.lim.Allow()
+	ctx, cancel := context.WithTimeout(testContext(t), 500*time.Millisecond)
+	err := c.advanceLimiter(ctx, false)
+	cancel()
+	// Existing default retry policy and error text are unchanged.
+	if err == nil || err.Error() != "rate: Wait(n=1) would exceed context deadline" || !isErrorRetryable(err) {
+		t.Fatalf("limiter error changed: %v", err)
+	}
+	ctx, cancel = context.WithCancel(testContext(t))
+	cancel()
+	if err := c.advanceLimiter(ctx, false); err != context.Canceled {
+		t.Fatalf("context error identity changed: %v", err)
+	}
+	ctx, cancel = context.WithDeadline(testContext(t), time.Now().Add(-time.Second))
+	defer cancel()
+	if err := c.advanceLimiter(ctx, false); err != context.DeadlineExceeded {
+		t.Fatalf("deadline error identity changed: %v", err)
+	}
+}
+
+type initializedResult struct {
+	prefix string
+	value  string
+}
+
+func (r *initializedResult) UnmarshalJSON(data []byte) error {
+	if r.prefix == "" {
+		return errors.New("decoder state was lost")
+	}
+	var value string
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	r.value = r.prefix + value
+	return nil
+}
+
+func TestParallelInitializedResults(t *testing.T) {
+	for _, batch := range []bool{false, true} {
+		t.Run(fmt.Sprintf("batch=%v", batch), func(t *testing.T) {
+			handler := func(context.Context, testRequest) (any, error) { return "value", nil }
+			c := testMultiClient(t, handler, handler)
+			result := initializedResult{prefix: "existing-"}
+			if batch {
+				b := []gethrpc.BatchElem{{Method: "eth_call", Result: &result}}
+				if err := c.BatchCall(b); err != nil || b[0].Error != nil {
+					t.Fatalf("unexpected errors: %v %v", err, b[0].Error)
+				}
+			} else if err := c.Call(&result, "eth_call"); err != nil {
+				t.Fatal(err)
+			}
+			if result.value != "existing-value" {
+				t.Fatalf("initialized receiver lost: %+v", result)
+			}
+		})
+	}
+	handler := func(context.Context, testRequest) (any, error) { return map[string]int{"new": 2}, nil }
+	c := testMultiClient(t, handler, handler)
+	result := map[string]int{"kept": 1}
+	if err := c.Call(&result, "eth_call"); err != nil || result["kept"] != 1 || result["new"] != 2 {
+		t.Fatalf("map decode semantics changed: %v, error: %v", result, err)
+	}
+}
+
+type countingResult struct {
+	calls *int
+	value string
+}
+
+func (r *countingResult) UnmarshalJSON(data []byte) error {
+	*r.calls = *r.calls + 1
+	return json.Unmarshal(data, &r.value)
+}
+
+func TestParallelDecodeErrorEndsRace(t *testing.T) {
+	for _, batch := range []bool{false, true} {
+		t.Run(fmt.Sprintf("batch=%v", batch), func(t *testing.T) {
+			started := make(chan struct{})
+			c := testMultiClient(t,
+				func(context.Context, testRequest) (any, error) { <-started; return 42, nil },
+				func(ctx context.Context, _ testRequest) (any, error) {
+					close(started)
+					<-ctx.Done()
+					return "later response", nil
+				},
+			)
+			calls := 0
+			result := countingResult{calls: &calls}
+			var err error
+			if batch {
+				b := []gethrpc.BatchElem{{Method: "eth_call", Result: &result}}
+				if err = c.BatchCallContext(testContext(t), b); err != nil {
+					t.Fatal(err)
+				}
+				err = b[0].Error
+			} else {
+				err = c.CallContext(testContext(t), &result, "eth_call")
+			}
+			var decodeErr *json.UnmarshalTypeError
+			if !errors.As(err, &decodeErr) || result.value != "" || calls != 1 {
+				t.Fatalf("expected one decode of the selected response, got %q, calls=%d, err=%v", result.value, calls, err)
+			}
+		})
+	}
+}
+
+func TestParallelInvalidResultDoesNotPanic(t *testing.T) {
+	handler := func(context.Context, testRequest) (any, error) { return "value", nil }
+	c := testMultiClient(t, handler, handler)
+	var typedNil *string
+	for _, result := range []any{typedNil, "not a pointer"} {
+		if err := c.Call(result, "eth_call"); err == nil {
+			t.Fatalf("expected error for result %T", result)
+		}
+	}
+}
+
+func TestTypedNilReadReceiverPreservesRPCError(t *testing.T) {
+	for _, parallel := range []bool{false, true} {
+		c := testMultiClient(t, func(context.Context, testRequest) (any, error) {
+			return nil, rpcOutcomeError{3, "execution reverted"}
+		})
+		c.parallelCalls = parallel
+		var result *string
+		err := c.Call(result, "eth_call")
+		coded, codeOK := err.(gethrpc.Error)
+		data, dataOK := err.(gethrpc.DataError)
+		if !codeOK || !dataOK || coded.ErrorCode() != 3 || data.ErrorData() != "0x12345678" {
+			t.Fatalf("parallel=%v: typed-nil receiver hid RPC error: %v", parallel, err)
+		}
+	}
+}
+
+func TestParallelErrorsPreserveTypes(t *testing.T) {
+	c := testMultiClient(t,
+		func(context.Context, testRequest) (any, error) { return nil, errors.New("execution reverted") },
+		func(context.Context, testRequest) (any, error) { return nil, errors.New("upstream failed") },
+	)
+	err := c.Call(nil, "eth_call")
+	rpcErr, ok := err.(gethrpc.Error)
+	if !ok || rpcErr.ErrorCode() != -32000 {
+		t.Fatalf("RPC error type was lost: %v", err)
+	}
+}
+
+type revertError struct{}
+
+func (revertError) Error() string  { return "execution reverted" }
+func (revertError) ErrorData() any { return "0x12345678" }
+
+func TestParallelErrorsPreserveRevertData(t *testing.T) {
+	handler := func(context.Context, testRequest) (any, error) { return nil, revertError{} }
+	c := testMultiClient(t, handler, handler)
+	var dataErr gethrpc.DataError
+	if err := c.Call(nil, "eth_call"); !errors.As(err, &dataErr) || dataErr.ErrorData() != "0x12345678" {
+		t.Fatalf("revert data was lost: %v", err)
+	}
+}
+
+type mutableArgument struct {
+	value string
+	calls int
+}
+
+func (a *mutableArgument) MarshalJSON() ([]byte, error) {
+	a.calls++
+	return json.Marshal(a.value)
+}
+
+func TestParallelBroadcastSnapshotsArguments(t *testing.T) {
+	for _, parallel := range []bool{false, true} {
+		t.Run(fmt.Sprintf("parallel=%v", parallel), func(t *testing.T) {
+			ctx := testContext(t)
+			sent := make(chan string, 1)
+			c := testMultiClient(t,
+				func(context.Context, testRequest) (any, error) { return "ok", nil },
+				func(_ context.Context, req testRequest) (any, error) {
+					sent <- req.Params[0]
+					return "ok", nil
+				},
+			)
+			c.parallelCalls = parallel
+			blocked := semaphore.NewWeighted(1)
+			if err := blocked.Acquire(ctx, 1); err != nil {
+				t.Fatal(err)
+			}
+			held := true
+			defer func() {
+				if held {
+					blocked.Release(1)
+				}
+			}()
+			c.allClients[1].rpcClient.sem = blocked
+			arg := &mutableArgument{value: "original"}
+			if err := c.CallContext(ctx, nil, "eth_sendRawTransaction", arg); err != nil {
+				t.Fatal(err)
+			}
+			arg.value = "changed after return"
+			if arg.calls != 1 {
+				t.Fatalf("user marshaller called %d times, want 1", arg.calls)
+			}
+			blocked.Release(1)
+			held = false
+			if got := receive(t, ctx, sent); got != "original" {
+				t.Fatalf("late provider read caller-owned input: %q", got)
+			}
+			// Ensure the worker has released its slot before cleanup.
+			if err := blocked.Acquire(ctx, 1); err != nil {
+				t.Fatal(err)
+			}
+			held = true
+		})
+	}
+}

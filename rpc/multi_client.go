@@ -3,6 +3,7 @@ package rpc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"slices"
 	"strings"
@@ -56,6 +57,8 @@ func (c *internalRpcClient) setEnabled(enabled bool) {
 }
 
 type MultiRpcClient struct {
+	parallelCalls                       bool
+	parallelCallTimeout                 time.Duration
 	preferHttpForNonSubscriptionRelated bool
 	healthCheckInterval                 time.Duration
 	healthCheckTimeout                  time.Duration
@@ -150,25 +153,25 @@ func DialMultiContext(ctx context.Context, cfg *MultiRpcClientConfig) (*MultiRpc
 	return c, nil
 }
 
-func (c *MultiRpcClient) getRpcClient(subscriptionRelated bool) (*internalRpcClient, error) {
-	candidates := make([]*internalRpcClient, 0)
-
-	// Filter out clients that are not capable of handling the request
+// Snapshot health once, before dispatching any calls.
+func (c *MultiRpcClient) eligibleClients(subscriptionRelated, broadcast bool) []*internalRpcClient {
+	clients := make([]*internalRpcClient, 0, len(c.allClients))
 	for _, client := range c.allClients {
 		if client.rpcClient.sendOnly {
+			if broadcast {
+				clients = append(clients, client)
+			}
 			continue
 		}
-
-		if !client.enabled.Load() {
-			continue
+		if client.enabled.Load() && (!subscriptionRelated || client.rpcClient.SupportsSubscriptions()) {
+			clients = append(clients, client)
 		}
-
-		if subscriptionRelated && !client.rpcClient.SupportsSubscriptions() {
-			continue
-		}
-
-		candidates = append(candidates, client)
 	}
+	return clients
+}
+
+func (c *MultiRpcClient) getRpcClient(subscriptionRelated bool) (*internalRpcClient, error) {
+	candidates := c.eligibleClients(subscriptionRelated, false)
 
 	var (
 		candidatesOverLimits = make([]*internalRpcClient, 0)
@@ -214,13 +217,23 @@ func (c *MultiRpcClient) BatchCall(b []rpc.BatchElem) error {
 }
 
 func (c *MultiRpcClient) BatchCallContext(ctx context.Context, b []rpc.BatchElem) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var subscriptionRelated bool
+	parallel := c.parallelCalls && len(b) > 0
 
 	for _, elem := range b {
 		if strings.HasSuffix(elem.Method, subscribeMethodSuffix) {
 			subscriptionRelated = true
+			parallel = false
 			break
 		}
+		parallel = parallel && parallelReadMethod(elem.Method)
+	}
+
+	if parallel {
+		return c.batchCallContextParallel(ctx, b)
 	}
 
 	ic, err := c.getRpcClient(subscriptionRelated)
@@ -246,9 +259,15 @@ func (c *MultiRpcClient) Call(result any, method string, args ...any) error {
 }
 
 func (c *MultiRpcClient) CallContext(ctx context.Context, result any, method string, args ...any) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	// Special handling for eth_sendRawTransaction: send to all clients in parallel
 	if method == "eth_sendRawTransaction" {
 		return c.callContextParallel(ctx, result, method, args...)
+	}
+	if c.parallelCalls && parallelReadMethod(method) {
+		return c.callContextConcurrent(ctx, result, method, args...)
 	}
 
 	ic, err := c.getRpcClient(strings.HasSuffix(method, subscribeMethodSuffix))
@@ -274,13 +293,14 @@ func (c *MultiRpcClient) CallContext(ctx context.Context, result any, method str
 // This is specifically designed for eth_sendRawTransaction
 func (c *MultiRpcClient) callContextParallel(ctx context.Context, result any, method string, args ...any) error {
 	// Get all available clients (send-only clients are always included)
-	availableClients := make([]*internalRpcClient, 0)
-	for _, client := range c.allClients {
-		if client.enabled.Load() || client.rpcClient.sendOnly {
-			availableClients = append(availableClients, client)
-		}
+	if err := validateParallelResult(result); err != nil {
+		return err
 	}
-
+	args, err := parallelArgs(args)
+	if err != nil {
+		return err
+	}
+	availableClients := c.eligibleClients(false, true)
 	if len(availableClients) == 0 {
 		return ErrNoAvailableClients
 	}
@@ -332,7 +352,7 @@ func (c *MultiRpcClient) callContextParallel(ctx context.Context, result any, me
 	}()
 
 	// Process results as they come in
-	errorMessages := make([]string, 0)
+	var failures providerErrors
 
 	for res := range resultChan {
 		if res.err == nil {
@@ -344,12 +364,11 @@ func (c *MultiRpcClient) callContextParallel(ctx context.Context, result any, me
 		}
 
 		// This call failed, collect the error
-		errorMessages = append(errorMessages, res.client.rpcClient.id+": "+res.err.Error())
+		failures = append(failures, fmt.Errorf("%s: %w", res.client.rpcClient.id, res.err))
 	}
 
 	// All calls failed - create a combined error
-	combinedError := "all clients failed for " + method + ": " + strings.Join(errorMessages, "; ")
-	return errors.New(combinedError)
+	return fmt.Errorf("all clients failed for %s: %w", method, failures)
 }
 
 func (c *MultiRpcClient) Close() {
